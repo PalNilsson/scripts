@@ -1,0 +1,11 @@
+#!/bin/bash
+
+which unzip > /dev/null
+if [ $? -ne 0 ]; then
+echo "ERROR:  unzip is missing"
+exit 111
+fi
+
+unzip -o $0 > /dev/null 2>&1
+PYNAME=`echo $0 | sed -e "s/\(-.*$\)/.py/"`
+exec python -u $PYNAME "$@"
