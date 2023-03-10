@@ -1,7 +1,5 @@
 #!/bin/bash
 
-WORKDIR=$PWD
-
 usage="$(basename "$0") [-h] [-q queue name] -- download PanDA queuedata for the given queue
 
 where:
