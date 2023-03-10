@@ -54,7 +54,7 @@ fi
 # was queuedata downloaded?
 if [ -f "$queuedata" ]; then
     echo "$queuedata exists."
-    for f in ${files[@]"; do
+    for f in ${files[@]}; do
         echo "copying $f to $destination in project $project"
         gcloud compute scp --recurse $f $destination --project "$project" --zone "$zone"
     done
