@@ -22,7 +22,7 @@ do
         h) echo $usage
           exit 0
           ;;
-        q) queue=${OPTARG};;
+        q) queuename=${OPTARG};;
         w) workdir=${OPTARG};;
         r) destination=${OPTARG};;
         g) project=${OPTARG};;
