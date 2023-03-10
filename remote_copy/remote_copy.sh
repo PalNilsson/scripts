@@ -16,7 +16,7 @@ if [[ $1 == "" ]]; then
   exit 1
 fi
 
-while getopts :hqwrgzp: flag
+while getopts :h:q:w:r:g:z:p: flag
 do
     case "${flag}" in
         h) echo $usage
