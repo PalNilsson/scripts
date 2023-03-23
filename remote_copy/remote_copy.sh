@@ -39,9 +39,8 @@ do
     esac
 done
 
-queuedata="$workdir/$queuename.json"
+queuedata="$workdir/queuedata.json"
 queuedata_script="queuedata.sh"
-files=($proxy $queuedata)
 
 # first download queuedata and store in file
 if [ -f "$queuedata_script" ]; then
@@ -50,6 +49,14 @@ else
     echo "$queuedata_script does not exist (copy it to this folder)"
     exit 1
 fi
+
+# download ddm endpoints
+curl -sS "https://atlas-cric.cern.ch/cache/ddmendpoints.json" >ddmendpoints.json
+
+# copy panda queue json
+cp /cvmfs/atlas.cern.ch/repo/sw/local/etc/cric_pandaqueues.json .
+
+files=($proxy $queuedata ddmendpoints.json cric_pandaqueues.json)
 
 # was queuedata downloaded?
 if [ -f "$queuedata" ]; then
