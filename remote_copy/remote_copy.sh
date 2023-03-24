@@ -77,7 +77,7 @@ if [ ${certificates+x} ]; then
     echo "$certificates will be transferred."
     files=(`ls $certificates`)
     for f in ${files[@]}; do
-        gcloud compute scp --recurse $f $destination --project "$project" --zone "$zone"
+        gcloud compute scp --recurse $certificates/$f $destination --project "$project" --zone "$zone"
     done
     echo done
 fi
