@@ -73,7 +73,7 @@ else
 fi
 
 # copy grid certificates
-if [ -f "$certificates" ]; then
+if [ -z ${certificates+x} ]; then
     echo "$certificates will be transferred."
 fi
 
