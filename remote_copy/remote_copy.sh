@@ -73,8 +73,13 @@ else
 fi
 
 # copy grid certificates
-if [ -z ${certificates+x} ]; then
+if [ ${certificates+x} ]; then
     echo "$certificates will be transferred."
+    files=(`ls $certificates`)
+    for f in ${files[@]}; do
+        gcloud compute scp --recurse $f $destination --project "$project" --zone "$zone"
+    done
+    echo done
 fi
 
 exit 0
