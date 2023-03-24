@@ -78,7 +78,7 @@ if [ ${certificates+x} ]; then
     files=(`ls $certificates`)
     for f in ${files[@]}; do
         echo "copying $f to $destination in project $project"
-        gcloud compute scp --recurse $certificates/$f $destination --project "$project" --zone "$zone"
+        gcloud compute scp --recurse $certificates/$f nfs-client:$certificates --project "$project" --zone "$zone"
     done
 fi
 
