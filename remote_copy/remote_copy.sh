@@ -1,6 +1,6 @@
 #!/bin/bash
 
-usage="$(basename "$0") [-h] [-q queue name] [-w work dir] [-r remote destination] [-g Google project] [-z zone] [-p proxy path] -- copy files to remote storage
+usage="$(basename "$0") [-h] [-q queue name] [-w work dir] [-r remote destination] [-g Google project] [-z zone] [-p proxy path] [-c grid certificates] -- copy files to remote storage
 
 where:
     -h  show this help text
@@ -9,14 +9,15 @@ where:
     -r  remote destination (e.g. nfs-client:/mnt/dask)
     -g  Google project
     -z  zone
-    -p  proxy path"
+    -p  proxy path
+    -c  grid certificates directory"
 
 if [[ $1 == "" ]]; then
   echo $usage
   exit 1
 fi
 
-while getopts :h:q:w:r:g:z:p: flag
+while getopts :h:q:w:r:g:z:p:c: flag
 do
     case "${flag}" in
         h) echo $usage
@@ -28,6 +29,7 @@ do
         g) project=${OPTARG};;
         z) zone=${OPTARG};;
         p) proxy=${OPTARG};;
+        c) certificates=${OPTARG};;
         :) printf "missing argument for -%s\n" "$OPTARG" >&2
           echo "$usage" >&2
           exit 1
@@ -69,5 +71,11 @@ else
     echo "$queuedata does not exist."
     exit 1
 fi
+
+# copy grid certificates
+if [ -f "$certificates" ]; then
+    echo "$certificates will be transferred."
+fi
+
 exit 0
 
