@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local test artefacts
+core
+core.*
+!core.*.md
+*.core
+tests/artifacts/
+crasher
+*.o
+
+# Analysis output
+*.raw-gdb.txt
+evidence*.json
