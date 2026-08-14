@@ -1,0 +1,11 @@
+# Runtime dependencies for analyze_core_dump.py
+#
+# gdb is also required but is a system package, not a pip package:
+#   RHEL/CentOS/Alma:  sudo dnf install gdb
+#   Debian/Ubuntu:     sudo apt-get install gdb
+#
+# For Python-level backtraces (py-bt) the interpreter's gdb helper must be
+# available. It ships with the interpreter on CVMFS/LCG builds; on a plain
+# distro install python3-debuginfo (RHEL) or python3-dbg (Debian/Ubuntu).
+
+anthropic>=0.40.0,<1.0.0
