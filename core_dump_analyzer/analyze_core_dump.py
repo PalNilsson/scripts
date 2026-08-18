@@ -37,10 +37,11 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 __version__ = "0.1.0"
 
@@ -54,6 +55,28 @@ DEFAULT_MAX_THREAD_GROUPS = 25
 DEFAULT_GDB_TIMEOUT = 120
 DEFAULT_MAX_TOKENS = 4000
 DEFAULT_MAX_EVIDENCE_CHARS = 50_000
+
+#: Seconds between "still running" heartbeat messages during a gdb phase.
+#: Only printed with --verbose; a phase producing no output for this long is
+#: exactly the "is it frozen?" situation the heartbeat exists to answer.
+DEFAULT_HEARTBEAT_INTERVAL = 15
+
+#: Core size, in MiB, above which a one-time slow-analysis warning is printed.
+#: Set --large-core-warning-mib 0 to disable. gdb reloads the whole core once
+#: per phase (see README on the deliberate per-phase-subprocess design), so
+#: wall-clock time scales with both core size and phase count.
+DEFAULT_LARGE_CORE_WARNING_MIB = 1024
+
+#: Rough characters-per-token ratio used only for a human-readable size log
+#: line before the API call. Not an accurate tokenizer; do not use for billing.
+CHARS_PER_TOKEN_ESTIMATE = 4
+
+#: Hard multiplier on --max-evidence-chars applied as a last-resort cap on the
+#: full rendered prompt just before the API call. enforce_global_budget()
+#: should always bring evidence under --max-evidence-chars first; this exists
+#: as defense-in-depth so a future evidence field can never bypass the budget
+#: and send an unbounded (and unboundedly expensive) prompt.
+HARD_CAP_MULTIPLIER = 2
 
 #: Per-section character budgets applied before the global budget.
 SECTION_LIMITS: dict[str, int] = {
@@ -229,7 +252,14 @@ def redact(text: str, enabled: bool = True) -> str:
     return text
 
 
-def truncate(text: str, limit: int, marker: str = "\n... [truncated] ...") -> tuple[str, bool]:
+#: Default separator inserted between the retained head and tail of truncated
+#: text. Shared with _shrink_text_field() so it can compute the true minimum
+#: length truncate() can produce for a given floor (limit + len(marker)),
+#: rather than looping forever comparing against a length it can never reach.
+TRUNCATION_MARKER = "\n... [truncated] ..."
+
+
+def truncate(text: str, limit: int, marker: str = TRUNCATION_MARKER) -> tuple[str, bool]:
     """Shorten text to a character budget, keeping head and tail.
 
     The head is favoured because the top stack frames matter most, but the tail
@@ -368,6 +398,28 @@ def gdb_version(gdb_path: str) -> str:
         return "unknown"
 
 
+def _report_heartbeat(name: str, started: float, stop_event: threading.Event, interval: int) -> None:
+    """Print periodic "still running" messages while a gdb phase is blocked.
+
+    ``subprocess.run(capture_output=True)`` buffers all of a phase's output
+    until the process exits, so nothing is printed while gdb is working no
+    matter how long that takes. On a large core, a single phase reloading and
+    walking the whole core can easily run past a minute; this background
+    thread is the only thing that distinguishes "still working" from "frozen"
+    during that window.
+
+    Args:
+        name: Short identifier for the phase being watched.
+        started: ``time.monotonic()`` value captured when the phase started.
+        stop_event: Set by the caller once the phase has finished, so this
+            loop exits promptly instead of waiting out its final interval.
+        interval: Seconds between heartbeat messages.
+    """
+    while not stop_event.wait(interval):
+        elapsed = time.monotonic() - started
+        print(f"[*] gdb phase '{name}' still running ({elapsed:.0f}s elapsed)...", file=sys.stderr)
+
+
 def run_gdb_phase(
     gdb_path: str,
     core_path: Path,
@@ -375,6 +427,9 @@ def run_gdb_phase(
     name: str,
     commands: Sequence[tuple[str, str]],
     timeout: int,
+    progress: bool = True,
+    detail: bool = False,
+    heartbeat_interval: int = DEFAULT_HEARTBEAT_INTERVAL,
 ) -> GdbPhaseResult:
     """Run one batch of gdb commands against the core file.
 
@@ -388,6 +443,11 @@ def run_gdb_phase(
         name: Short identifier for this phase.
         commands: ``(section_name, gdb_command)`` pairs to execute in order.
         timeout: Per-phase timeout in seconds.
+        progress: Whether to print a start/finish line for this phase.
+        detail: Whether to also print periodic heartbeat messages while the
+            phase is running. Has no effect if ``progress`` is ``False``.
+        heartbeat_interval: Seconds between heartbeat messages when ``detail``
+            is enabled.
 
     Returns:
         A :class:`GdbPhaseResult` describing the invocation.
@@ -401,11 +461,23 @@ def run_gdb_phase(
     for section, command in commands:
         argv += ["-ex", f"echo \\n{SECTION_MARKER.format(name=section)}\\n", "-ex", command]
 
+    if progress:
+        print(f"[*] gdb phase '{name}' starting...", file=sys.stderr)
+
     started = time.monotonic()
+    stop_event = threading.Event()
+    heartbeat_thread: threading.Thread | None = None
+    if progress and detail:
+        heartbeat_thread = threading.Thread(
+            target=_report_heartbeat, args=(name, started, stop_event, heartbeat_interval), daemon=True,
+        )
+        heartbeat_thread.start()
+
+    timed_out = False
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
         stdout = proc.stdout or ""
-        return GdbPhaseResult(
+        result = GdbPhaseResult(
             name=name,
             commands=[cmd for _, cmd in commands],
             sections=split_sections(stdout),
@@ -415,7 +487,8 @@ def run_gdb_phase(
             duration_s=round(time.monotonic() - started, 2),
         )
     except subprocess.TimeoutExpired as exc:
-        return GdbPhaseResult(
+        timed_out = True
+        result = GdbPhaseResult(
             name=name,
             commands=[cmd for _, cmd in commands],
             stdout=exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or ""),
@@ -424,6 +497,15 @@ def run_gdb_phase(
             timed_out=True,
             duration_s=round(time.monotonic() - started, 2),
         )
+    finally:
+        stop_event.set()
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=1.0)
+
+    if progress:
+        status = f"timed out after {result.duration_s:.1f}s" if timed_out else f"completed in {result.duration_s:.1f}s"
+        print(f"[*] gdb phase '{name}' {status}", file=sys.stderr)
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -431,7 +513,14 @@ def run_gdb_phase(
 # --------------------------------------------------------------------------- #
 
 
-def executable_from_auxv(gdb_path: str, core_path: Path, timeout: int) -> str | None:
+def executable_from_auxv(
+    gdb_path: str,
+    core_path: Path,
+    timeout: int,
+    progress: bool = True,
+    detail: bool = False,
+    heartbeat_interval: int = DEFAULT_HEARTBEAT_INTERVAL,
+) -> str | None:
     """Recover the executable path from the core's ``AT_EXECFN`` auxiliary vector entry.
 
     This is the most portable source: gdb can read it from a bare core with no
@@ -442,11 +531,18 @@ def executable_from_auxv(gdb_path: str, core_path: Path, timeout: int) -> str | 
         gdb_path: Path to the gdb executable.
         core_path: Path to the core dump file.
         timeout: gdb timeout in seconds.
+        progress: Whether to print a start/finish line for the gdb probe.
+        detail: Whether to also print heartbeat messages during the probe.
+        heartbeat_interval: Seconds between heartbeat messages when ``detail``
+            is enabled.
 
     Returns:
         The recorded executable path, or ``None`` if it could not be read.
     """
-    result = run_gdb_phase(gdb_path, core_path, None, "auxv", [("auxv", "info auxv")], timeout)
+    result = run_gdb_phase(
+        gdb_path, core_path, None, "auxv", [("auxv", "info auxv")], timeout,
+        progress=progress, detail=detail, heartbeat_interval=heartbeat_interval,
+    )
     match = re.search(r"AT_EXECFN\s+File name of executable\s+0x[0-9a-fA-F]+\s+\"(.+?)\"", result.stdout)
     return match.group(1) if match else None
 
@@ -552,7 +648,9 @@ def _existing_path(candidate: str | None) -> tuple[str | None, bool]:
 
 
 def resolve_executable(gdb_path: str, core_path: Path, explicit: str | None,
-                       probe_output: str, timeout: int) -> dict[str, Any]:
+                       probe_output: str, timeout: int, progress: bool = True,
+                       detail: bool = False,
+                       heartbeat_interval: int = DEFAULT_HEARTBEAT_INTERVAL) -> dict[str, Any]:
     """Determine which ELF binary gdb should load alongside the core.
 
     Resolution order is ``--exe``, then ``AT_EXECFN`` from the auxiliary vector,
@@ -566,6 +664,10 @@ def resolve_executable(gdb_path: str, core_path: Path, explicit: str | None,
         explicit: User-supplied executable path, or ``None``.
         probe_output: Output of a bare ``gdb -c core`` probe run.
         timeout: gdb timeout in seconds.
+        progress: Whether to print progress for any gdb probe this triggers.
+        detail: Whether to also print heartbeat messages during those probes.
+        heartbeat_interval: Seconds between heartbeat messages when ``detail``
+            is enabled.
 
     Returns:
         A dictionary with keys ``path``, ``resolved``, ``source``, ``recorded``
@@ -587,7 +689,8 @@ def resolve_executable(gdb_path: str, core_path: Path, explicit: str | None,
                     "source": "--exe", "recorded": None, "notes": notes}
 
     candidates: list[tuple[str, str | None]] = [
-        ("AT_EXECFN", executable_from_auxv(gdb_path, core_path, timeout)),
+        ("AT_EXECFN", executable_from_auxv(
+            gdb_path, core_path, timeout, progress=progress, detail=detail, heartbeat_interval=heartbeat_interval)),
         ("NT_FILE", executable_from_nt_file(core_path)),
         ("command-line", _argv0_from_command_line(parse_generated_by(probe_output))),
     ]
@@ -849,12 +952,20 @@ def _trim_primary_sections(sections: dict[str, str], redact_enabled: bool) -> tu
     return trimmed, truncated
 
 
-def collect_evidence(args: argparse.Namespace, verbose: bool = False) -> tuple[CoreEvidence, str]:
+def collect_evidence(
+    args: argparse.Namespace, progress: bool = True, detail: bool = False,
+) -> tuple[CoreEvidence, str]:
     """Drive gdb and assemble the structured evidence bundle.
 
     Args:
         args: Parsed command-line arguments.
-        verbose: Whether to log progress to stderr.
+        progress: Whether to print basic phase-level progress to stderr. gdb
+            buffers all output of a phase until it exits, so without this a
+            large core can appear to hang with no indication anything is
+            happening.
+        detail: Whether to also print periodic heartbeat messages while a
+            phase is running, and note when a phase's evidence gets trimmed
+            to fit the budget. Has no effect if ``progress`` is ``False``.
 
     Returns:
         A tuple of the :class:`CoreEvidence` and the concatenated raw gdb output.
@@ -869,31 +980,50 @@ def collect_evidence(args: argparse.Namespace, verbose: bool = False) -> tuple[C
     gdb_path = find_gdb(args.gdb)
     evidence = CoreEvidence()
     stat = core_path.stat()
+    size_mib = stat.st_size / (1024 ** 2)
     evidence.core_file = {
         "path": str(core_path),
         "size_bytes": stat.st_size,
-        "size_human": f"{stat.st_size / (1024 ** 2):.1f} MiB",
+        "size_human": f"{size_mib:.1f} MiB",
         "modified": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stat.st_mtime)),
     }
     evidence.gdb = {"path": gdb_path, "version": gdb_version(gdb_path)}
 
-    if verbose:
-        print(f"[*] Probing {core_path.name} to resolve the executable...", file=sys.stderr)
-    probe = run_gdb_phase(gdb_path, core_path, None, "probe", [("program", "info program")], args.gdb_timeout)
+    warning_threshold = getattr(args, "large_core_warning_mib", DEFAULT_LARGE_CORE_WARNING_MIB)
+    if progress:
+        print(f"[*] Core file: {core_path.name} ({size_mib:.1f} MiB), gdb {evidence.gdb['version']}",
+              file=sys.stderr)
+        if warning_threshold and size_mib >= warning_threshold:
+            print(
+                f"[*] This core is above {warning_threshold} MiB. gdb reloads the whole core once per "
+                "analysis phase, so each of the phases below can take from several seconds to a few "
+                "minutes on a core this size -- that is expected, not a hang. Pass -v for a periodic "
+                "'still running' heartbeat during long phases.",
+                file=sys.stderr,
+            )
+        print("[*] Resolving executable...", file=sys.stderr)
+
+    heartbeat_interval = getattr(args, "heartbeat_interval", DEFAULT_HEARTBEAT_INTERVAL)
+    probe = run_gdb_phase(
+        gdb_path, core_path, None, "probe", [("program", "info program")], args.gdb_timeout,
+        progress=progress, detail=detail, heartbeat_interval=heartbeat_interval,
+    )
     evidence.executable = resolve_executable(
-        gdb_path, core_path, args.exe, probe.stdout + probe.stderr, args.gdb_timeout
+        gdb_path, core_path, args.exe, probe.stdout + probe.stderr, args.gdb_timeout,
+        progress=progress, detail=detail, heartbeat_interval=heartbeat_interval,
     )
     exe_path = evidence.executable.get("path")
-    if verbose:
+    if progress:
         print(f"[*] Executable: {exe_path or 'UNRESOLVED'} (via {evidence.executable['source']})", file=sys.stderr)
 
     raw_chunks: list[str] = [f"$ gdb -c {core_path.name} -ex 'info program'\n{probe.stdout}\n{probe.stderr}"]
     sections: dict[str, str] = {}
     errors: dict[str, str] = {}
     for name, commands in _build_phase_plan(args):
-        if verbose:
-            print(f"[*] gdb phase: {name}", file=sys.stderr)
-        result = run_gdb_phase(gdb_path, core_path, exe_path, name, commands, args.gdb_timeout)
+        result = run_gdb_phase(
+            gdb_path, core_path, exe_path, name, commands, args.gdb_timeout,
+            progress=progress, detail=detail, heartbeat_interval=heartbeat_interval,
+        )
         sections.update(result.sections)
         errors[name] = result.stderr
         banner = "=" * 70
@@ -970,20 +1100,175 @@ def _summarise_python(text: str, source: str, stderr: str, redact_enabled: bool)
     return {"available": True, "backtrace": backtrace, "source_context": context}
 
 
-def enforce_global_budget(evidence: CoreEvidence, limit: int) -> CoreEvidence:
-    """Drop the least informative thread groups until the budget is met.
+def _serialized_size(evidence: CoreEvidence) -> int:
+    """Return the character length of the evidence exactly as sent to the LLM.
+
+    Uses the same ``indent=2`` formatting as :func:`build_user_prompt` so this
+    is a faithful stand-in for the size of the real prompt, not just a proxy.
+
+    Args:
+        evidence: The assembled evidence.
+
+    Returns:
+        Length in characters of the JSON-serialised evidence.
+    """
+    return len(json.dumps(evidence.to_dict(), indent=2, default=str))
+
+
+def _shrink_shared_libraries(evidence: CoreEvidence) -> bool:
+    """Halve the list of symbol-less shared libraries, if any remain.
+
+    Args:
+        evidence: The assembled evidence, mutated in place.
+
+    Returns:
+        ``True`` if the list was shrunk, ``False`` if it was already empty.
+    """
+    libraries = evidence.shared_libraries.get("without_symbols") or []
+    if not libraries:
+        return False
+    evidence.shared_libraries["without_symbols"] = libraries[: len(libraries) // 2]
+    if "shared_libraries.without_symbols" not in evidence.truncated_sections:
+        evidence.truncated_sections.append("shared_libraries.without_symbols")
+    return True
+
+
+def _pop_thread_group(evidence: CoreEvidence) -> bool:
+    """Drop the least interesting remaining thread group.
+
+    Groups are already sorted busy-before-idle (see :func:`group_thread_stacks`),
+    so this always removes an idle group before a busy one, and always leaves
+    at least one group so the model has *some* thread evidence.
+
+    Args:
+        evidence: The assembled evidence, mutated in place.
+
+    Returns:
+        ``True`` if a group was dropped, ``False`` if only one group remains.
+    """
+    if len(evidence.thread_groups) <= 1:
+        return False
+    evidence.thread_groups.pop()
+    if "thread_groups" not in evidence.truncated_sections:
+        evidence.truncated_sections.append("thread_groups")
+    return True
+
+
+def _drop_python_source(evidence: CoreEvidence) -> bool:
+    """Remove the ``py-list`` source context, keeping the ``py-bt`` traceback.
+
+    Args:
+        evidence: The assembled evidence, mutated in place.
+
+    Returns:
+        ``True`` if source context was present and dropped, ``False`` otherwise.
+    """
+    if not evidence.python.get("source"):
+        return False
+    evidence.python["source"] = ""
+    if "python.source" not in evidence.truncated_sections:
+        evidence.truncated_sections.append("python.source")
+    return True
+
+
+def _shrink_text_field(
+    container: dict[str, str], key: str, label: str, evidence: CoreEvidence, floor: int = 500,
+) -> bool:
+    """Halve a text field toward a floor, keeping head and tail.
+
+    ``truncate()`` can never produce text shorter than ``limit + len(marker)``,
+    since the marker itself is always inserted. The stopping condition compares
+    against that true minimum rather than the bare floor, so this reliably
+    terminates instead of "succeeding" forever at a length it can never reduce
+    further -- which would hang :func:`enforce_global_budget` in an infinite
+    loop on any evidence still over budget once a field reaches its floor.
+
+    Args:
+        container: The dict holding the field, e.g. ``evidence.primary_thread``.
+        key: The key within ``container`` to shrink.
+        label: Name recorded in ``evidence.truncated_sections`` when shrunk.
+        evidence: The evidence bundle, for recording that truncation happened.
+        floor: Minimum length to shrink toward; returns ``False`` once reached.
+
+    Returns:
+        ``True`` if the field was shrunk, ``False`` if absent or already at
+        the floor.
+    """
+    body = container.get(key, "")
+    min_len = floor + len(TRUNCATION_MARKER)
+    if len(body) <= min_len:
+        return False
+    trimmed, _ = truncate(body, max(floor, len(body) // 2))
+    container[key] = trimmed
+    if label not in evidence.truncated_sections:
+        evidence.truncated_sections.append(label)
+    return True
+
+
+def enforce_global_budget(evidence: CoreEvidence, limit: int, detail: bool = False) -> CoreEvidence:
+    """Shrink the evidence bundle to fit a character budget for the LLM prompt.
+
+    Applies a cascade of reduction stages, cheapest evidence first, moving to
+    the next stage only once the current one stops helping (e.g. thread groups
+    are down to one, or a text field has hit its floor). This exists because
+    per-section limits (:data:`SECTION_LIMITS`) cap each field individually,
+    but do not cap the bundle as a whole -- a job with both a huge ``locals``
+    dump and many distinct thread stacks could previously exceed ``limit`` even
+    after every thread group but one had been dropped.
+
+    Stage order (least to most valuable evidence):
+        1. ``shared_libraries.without_symbols``
+        2. ``thread_groups`` (idle groups first, per their existing sort)
+        3. ``python.source``
+        4. ``primary_thread.locals``
+        5. ``primary_thread.registers``
+        6. ``primary_thread.args``
+        7. ``python.backtrace``
+        8. ``primary_thread.backtrace`` (last resort)
 
     Args:
         evidence: The assembled evidence.
         limit: Maximum total serialised size in characters.
+        detail: Whether to log which sections were trimmed to stderr.
 
     Returns:
-        The same evidence object, possibly with thread groups removed.
+        The same evidence object, mutated to fit within ``limit`` wherever the
+        cascade was able to. See ``evidence.warnings`` for whether it fully
+        succeeded.
     """
-    while len(json.dumps(evidence.to_dict())) > limit and len(evidence.thread_groups) > 1:
-        evidence.thread_groups.pop()
-        if "thread_groups" not in evidence.truncated_sections:
-            evidence.truncated_sections.append("thread_groups")
+    stages: list[tuple[str, Callable[[], bool]]] = [
+        ("shared_libraries.without_symbols", lambda: _shrink_shared_libraries(evidence)),
+        ("thread_groups", lambda: _pop_thread_group(evidence)),
+        ("python.source", lambda: _drop_python_source(evidence)),
+        ("primary_thread.locals",
+         lambda: _shrink_text_field(evidence.primary_thread, "locals", "primary_thread.locals", evidence)),
+        ("primary_thread.registers",
+         lambda: _shrink_text_field(evidence.primary_thread, "registers", "primary_thread.registers", evidence)),
+        ("primary_thread.args",
+         lambda: _shrink_text_field(evidence.primary_thread, "args", "primary_thread.args", evidence)),
+        ("python.backtrace",
+         lambda: _shrink_text_field(evidence.python, "backtrace", "python.backtrace", evidence)),
+        ("primary_thread.backtrace",
+         lambda: _shrink_text_field(
+             evidence.primary_thread, "backtrace", "primary_thread.backtrace", evidence, floor=1000)),
+    ]
+
+    stage_index = 0
+    while _serialized_size(evidence) > limit and stage_index < len(stages):
+        _, shrink = stages[stage_index]
+        if not shrink():
+            stage_index += 1
+
+    if _serialized_size(evidence) > limit:
+        evidence.warnings.append(
+            f"Evidence remains above the {limit}-character budget even after all reduction stages; "
+            "sending it as-is. Consider raising --max-evidence-chars or lowering --max-thread-groups."
+        )
+    if detail and evidence.truncated_sections:
+        print(
+            f"[*] Evidence trimmed to fit the {limit}-character budget: {', '.join(evidence.truncated_sections)}",
+            file=sys.stderr,
+        )
     return evidence
 
 
@@ -1101,14 +1386,64 @@ def extract_json_object(text: str) -> dict[str, Any] | None:
         return None
 
 
-def analyze_with_llm(evidence: CoreEvidence, model: str, max_tokens: int, verbose: bool = False) -> dict[str, Any]:
+def _cap_user_prompt(prompt: str, max_evidence_chars: int, evidence: CoreEvidence) -> str:
+    """Apply a hard, last-resort ceiling to the rendered user prompt.
+
+    :func:`enforce_global_budget` should already have brought the evidence
+    under ``max_evidence_chars`` before this is ever called. This is a second,
+    independent check applied to the actual prompt text right before it goes
+    over the wire: defense-in-depth so that a future evidence field, or a call
+    site that forgets to run the budget pass, can never send an unbounded (and
+    unboundedly expensive) prompt to the API.
+
+    Args:
+        prompt: The fully rendered user message.
+        max_evidence_chars: The evidence budget the caller intended to enforce.
+        evidence: The evidence bundle, so a warning can be recorded if this
+            cap actually had to do something.
+
+    Returns:
+        ``prompt``, unchanged if already within the hard cap, otherwise
+        truncated to it.
+    """
+    hard_cap = max_evidence_chars * HARD_CAP_MULTIPLIER
+    if len(prompt) <= hard_cap:
+        return prompt
+    evidence.warnings.append(
+        f"The rendered LLM prompt ({len(prompt):,} chars) exceeded the hard {hard_cap:,}-char cost cap "
+        f"({HARD_CAP_MULTIPLIER}x --max-evidence-chars) even after evidence reduction, and was truncated "
+        "before being sent. This should not normally happen; if it does routinely, lower "
+        "--max-thread-groups or investigate what is making the evidence so large."
+    )
+    capped, _ = truncate(prompt, hard_cap, marker="\n... [TRUNCATED FOR COST PROTECTION] ...")
+    return capped
+
+
+def analyze_with_llm(
+    evidence: CoreEvidence,
+    model: str,
+    max_tokens: int,
+    max_evidence_chars: int = DEFAULT_MAX_EVIDENCE_CHARS,
+    progress: bool = True,
+    detail: bool = False,
+) -> dict[str, Any]:
     """Send the evidence to the Anthropic API and parse the structured verdict.
 
     Args:
         evidence: The assembled evidence.
         model: Anthropic model identifier.
         max_tokens: Maximum tokens for the response.
-        verbose: Whether to log progress to stderr.
+        max_evidence_chars: The evidence budget already applied by
+            :func:`enforce_global_budget`, reused here to derive a hard cost
+            ceiling on the actual outgoing prompt (see :func:`_cap_user_prompt`).
+            Defaults to :data:`DEFAULT_MAX_EVIDENCE_CHARS` so this function
+            remains usable on its own, without requiring every caller to
+            thread the CLI's budget value through explicitly.
+        progress: Whether to print a line before and after the API call.
+        detail: Whether to also log the outgoing prompt size and a rough
+            estimated token count before the call. The estimate is a simple
+            ``chars / 4`` heuristic, not a real tokenizer -- good enough to
+            catch an unexpectedly huge payload, not for billing.
 
     Returns:
         A dictionary with the parsed analysis plus ``_meta`` describing the call.
@@ -1125,7 +1460,16 @@ def analyze_with_llm(evidence: CoreEvidence, model: str, max_tokens: int, verbos
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY is not set. Export it, or run with --no-llm.")
 
-    if verbose:
+    user_prompt = _cap_user_prompt(build_user_prompt(evidence), max_evidence_chars, evidence)
+
+    if detail:
+        estimated_tokens = len(user_prompt) // CHARS_PER_TOKEN_ESTIMATE
+        print(
+            f"[*] Evidence prompt: {len(user_prompt):,} chars (~{estimated_tokens:,} est. input tokens; "
+            "rough chars/4 heuristic, not exact)",
+            file=sys.stderr,
+        )
+    if progress:
         print(f"[*] Querying {model} ({evidence.mode} mode)...", file=sys.stderr)
 
     client = Anthropic(api_key=api_key)
@@ -1134,7 +1478,7 @@ def analyze_with_llm(evidence: CoreEvidence, model: str, max_tokens: int, verbos
             model=model,
             max_tokens=max_tokens,
             system=build_system_prompt(evidence.mode),
-            messages=[{"role": "user", "content": build_user_prompt(evidence)}],
+            messages=[{"role": "user", "content": user_prompt}],
         )
     except Exception as exc:  # noqa: BLE001 - surface any SDK/transport failure uniformly
         raise RuntimeError(f"Anthropic API call failed: {exc}") from exc
@@ -1148,6 +1492,9 @@ def analyze_with_llm(evidence: CoreEvidence, model: str, max_tokens: int, verbos
         "output_tokens": getattr(response.usage, "output_tokens", None),
         "stop_reason": getattr(response, "stop_reason", None),
     }
+    if progress:
+        print(f"[*] Response received (in: {meta['input_tokens']} tok, out: {meta['output_tokens']} tok)",
+              file=sys.stderr)
     if parsed is None:
         return {"verdict": "The model did not return parsable JSON.", "explanation": text, "_meta": meta}
     parsed["_meta"] = meta
@@ -1292,9 +1639,37 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--json", dest="json_out", default=None,
                         help="Write the full evidence and analysis to this JSON file.")
     parser.add_argument("--raw-gdb", default=None, help="Write the unprocessed gdb output to this file.")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Log progress to stderr.")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Also log a heartbeat during long gdb phases and the outgoing evidence "
+                             "size/token estimate. Basic phase progress is logged by default; see -q.")
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="Suppress all progress logging to stderr, including -v output.")
+    parser.add_argument("--heartbeat-interval", type=int, default=DEFAULT_HEARTBEAT_INTERVAL,
+                        help="Seconds between -v heartbeat messages during a gdb phase "
+                             f"(default: {DEFAULT_HEARTBEAT_INTERVAL}).")
+    parser.add_argument("--large-core-warning-mib", type=int, default=DEFAULT_LARGE_CORE_WARNING_MIB,
+                        help="Core size in MiB above which a one-time slow-analysis note is printed. "
+                             f"0 disables it (default: {DEFAULT_LARGE_CORE_WARNING_MIB}).")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser.parse_args(argv)
+
+
+def resolve_logging_flags(args: argparse.Namespace) -> tuple[bool, bool]:
+    """Resolve effective progress/heartbeat verbosity from the CLI flags.
+
+    ``--quiet`` always wins: it suppresses both the default progress lines and
+    anything ``-v``/``--verbose`` would otherwise add.
+
+    Args:
+        args: Parsed command-line arguments.
+
+    Returns:
+        A tuple of ``(progress, detail)``: whether to print basic phase-level
+        progress at all, and whether to additionally print heartbeats and
+        size/token estimates.
+    """
+    quiet = getattr(args, "quiet", False)
+    return not quiet, bool(getattr(args, "verbose", False)) and not quiet
 
 
 def resolve_model(explicit: str | None) -> str:
@@ -1320,9 +1695,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         ``0`` on success, ``1`` on a handled error, ``130`` on interrupt.
     """
     args = parse_args(argv)
+    progress, detail = resolve_logging_flags(args)
+    started = time.monotonic()
     try:
-        evidence, raw = collect_evidence(args, verbose=args.verbose)
-        evidence = enforce_global_budget(evidence, args.max_evidence_chars)
+        evidence, raw = collect_evidence(args, progress=progress, detail=detail)
+        evidence = enforce_global_budget(evidence, args.max_evidence_chars, detail=detail)
     except (FileNotFoundError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -1332,13 +1709,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.raw_gdb:
         Path(args.raw_gdb).write_text(redact(raw, not args.no_redact), encoding="utf-8")
-        if args.verbose:
+        if detail:
             print(f"[*] Raw gdb output written to {args.raw_gdb}", file=sys.stderr)
 
     analysis: dict[str, Any] | None = None
     if not args.no_llm:
         try:
-            analysis = analyze_with_llm(evidence, resolve_model(args.model), args.max_tokens, verbose=args.verbose)
+            analysis = analyze_with_llm(
+                evidence, resolve_model(args.model), args.max_tokens, args.max_evidence_chars,
+                progress=progress, detail=detail,
+            )
         except RuntimeError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
@@ -1353,8 +1733,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "analysis": analysis,
         }
         Path(args.json_out).write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-        if args.verbose:
+        if detail:
             print(f"[*] JSON written to {args.json_out}", file=sys.stderr)
+
+    if progress:
+        print(f"[*] Done in {time.monotonic() - started:.1f}s", file=sys.stderr)
     return 0
 
 

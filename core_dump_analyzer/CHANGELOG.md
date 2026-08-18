@@ -28,8 +28,34 @@ All notable changes to this project are documented here. The format follows
   limitations rather than guess.
 - Structured JSON output (`--json`) alongside the human-readable report, plus
   raw gdb capture (`--raw-gdb`).
-- Test suite of 74 tests, runnable without a core file or API key, and
-  `tests/generate_test_cores.sh` to produce crash and hang fixtures locally.
+- Test suite, runnable without a core file or API key, and
+  `tests/generate_test_cores.sh` to produce crash and hang fixtures locally
+  (74 tests at initial prototype, 92 after the progress/budget work below).
+- Default-on progress logging to stderr (core size, gdb version, executable
+  resolution, per-phase start/finish with duration) so a multi-minute gdb
+  phase on a large core reads as "working," not "frozen." `-q`/`--quiet`
+  suppresses it for scripted use.
+- `-v`/`--verbose` heartbeat: a background thread prints a periodic
+  `still running (Ns elapsed)` line during any gdb phase, since
+  `subprocess.run(capture_output=True)` otherwise produces zero output for
+  the full duration of a phase, however long it takes.
+- One-time warning when the core exceeds `--large-core-warning-mib` (default
+  1024), noting up front that gdb reloads the whole core once per phase and
+  wall-clock time scales with core size.
+- Multi-stage evidence-budget cascade in `enforce_global_budget`: once thread
+  groups are down to one, further stages now shrink
+  `shared_libraries.without_symbols`, `python.source`, `primary_thread.locals`
+  /`registers`/`args`, `python.backtrace` and finally `primary_thread.backtrace`
+  before giving up and recording a warning. Closes the gap where a large
+  `primary_thread`/`python` bundle alone could exceed `--max-evidence-chars`
+  with nothing left to trim.
+- Hard failsafe cost cap in `analyze_with_llm` (`--max-evidence-chars` x2):
+  truncates the actual outgoing prompt independently of
+  `enforce_global_budget`, so a future evidence field or a call site that
+  skips the budget pass can never send an unbounded prompt.
+- `-v` now also logs the outgoing evidence size and a rough
+  characters/4 token estimate before the API call, and the response's
+  reported input/output token usage after it.
 
 ### Fixed
 
@@ -47,3 +73,9 @@ All notable changes to this project are documented here. The format follows
   `Thread 0x...`.
 - gdb load banners (`[New LWP ...]`, `[Current thread is ...]`) no longer leak
   into extracted sections.
+- `enforce_global_budget`'s new per-field shrink stage no longer loops forever
+  once a field reaches its floor: `truncate()` always adds its marker text, so
+  a field can never actually reach a raw character floor, only
+  `floor + len(marker)`. The stopping check now compares against that true
+  minimum. Caught before this ever shipped, via a dedicated termination test
+  (`test_shrink_text_field_terminates_at_floor`) rather than a live run.

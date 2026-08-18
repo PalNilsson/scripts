@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import time
 import types
 from pathlib import Path
 from typing import Any
@@ -65,7 +67,9 @@ def make_args(**overrides: Any) -> argparse.Namespace:
         "max_frames": 40, "max_thread_groups": 25, "max_tokens": 4000,
         "max_evidence_chars": 50_000, "locals": True, "no_redact": False,
         "gdb": None, "gdb_timeout": 120, "no_llm": False, "json_out": None,
-        "raw_gdb": None, "verbose": False,
+        "raw_gdb": None, "verbose": False, "quiet": False,
+        "heartbeat_interval": acd.DEFAULT_HEARTBEAT_INTERVAL,
+        "large_core_warning_mib": acd.DEFAULT_LARGE_CORE_WARNING_MIB,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -459,6 +463,60 @@ def test_enforce_global_budget_noop_when_small() -> None:
     assert evidence.truncated_sections == []
 
 
+def test_shrink_text_field_terminates_at_floor() -> None:
+    """Must stop once truncate() can no longer shorten the field further.
+
+    Regression test: the field must not report a successful shrink forever
+    once it reaches a length truncate() can never actually get below.
+    """
+    evidence = acd.CoreEvidence()
+    container = {"locals": "X" * 5000}
+    iterations = 0
+    while acd._shrink_text_field(container, "locals", "primary_thread.locals", evidence, floor=500):
+        iterations += 1
+        assert iterations < 100, "did not converge -- infinite loop regression"
+    assert len(container["locals"]) <= 500 + len(acd.TRUNCATION_MARKER)
+
+
+def test_enforce_global_budget_shrinks_primary_thread_when_groups_insufficient() -> None:
+    """Once thread_groups bottoms out at one, the cascade keeps going.
+
+    Regression for the gap where primary_thread/python sections alone could
+    exceed the budget and nothing past "one thread group" would trim them.
+    """
+    evidence = acd.CoreEvidence()
+    evidence.thread_groups = [acd.ThreadGroup(count=1, thread_ids=["1"], names=[], backtrace="Y" * 500)]
+    evidence.primary_thread = {"locals": "L" * 20_000, "backtrace": "B" * 2_000}
+    acd.enforce_global_budget(evidence, 3_000)
+    assert len(evidence.thread_groups) == 1
+    assert "primary_thread.locals" in evidence.truncated_sections
+    assert acd._serialized_size(evidence) < 10_000
+
+
+def test_enforce_global_budget_warns_when_unreachable() -> None:
+    """An impossibly small budget still terminates, with a warning recorded."""
+    evidence = acd.CoreEvidence()
+    evidence.thread_groups = [acd.ThreadGroup(count=1, thread_ids=["1"], names=[], backtrace="Z" * 3_000)]
+    evidence.primary_thread = {"backtrace": "B" * 3_000}
+    acd.enforce_global_budget(evidence, 10)
+    assert any("budget" in warning for warning in evidence.warnings)
+
+
+def test_cap_user_prompt_noop_when_within_limit() -> None:
+    """A prompt already under the hard cap is returned unchanged."""
+    evidence = acd.CoreEvidence()
+    assert acd._cap_user_prompt("short prompt", 1_000, evidence) == "short prompt"
+    assert evidence.warnings == []
+
+
+def test_cap_user_prompt_enforces_hard_ceiling() -> None:
+    """An oversized prompt is truncated to max_evidence_chars * HARD_CAP_MULTIPLIER."""
+    evidence = acd.CoreEvidence()
+    capped = acd._cap_user_prompt("P" * 10_000, 1_000, evidence)
+    assert len(capped) <= 2_000 + len("\n... [TRUNCATED FOR COST PROTECTION] ...")
+    assert any("cost cap" in warning.lower() for warning in evidence.warnings)
+
+
 def test_resolve_model_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
     """--model beats CORE_ANALYSIS_MODEL, which beats LLM_DEFAULT_MODEL."""
     monkeypatch.setenv("CORE_ANALYSIS_MODEL", "from-core-var")
@@ -544,6 +602,152 @@ def test_analyze_with_llm_wraps_transport_errors(monkeypatch: pytest.MonkeyPatch
         acd.analyze_with_llm(acd.CoreEvidence(), "claude-sonnet-4-6", 4000)
 
 
+def test_analyze_with_llm_applies_hard_cap_even_without_budget_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The hard cap protects the API call even if enforce_global_budget was skipped."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    captured: dict[str, Any] = {}
+    _install_stub_sdk(monkeypatch, json.dumps({"verdict": "x"}), captured)
+    evidence = acd.CoreEvidence(mode="hang")
+    evidence.primary_thread = {"backtrace": "A" * 200_000}
+    acd.analyze_with_llm(evidence, "claude-sonnet-4-6", 4000, max_evidence_chars=1_000)
+    sent = captured["messages"][0]["content"]
+    assert len(sent) <= 1_000 * acd.HARD_CAP_MULTIPLIER + len("\n... [TRUNCATED FOR COST PROTECTION] ...")
+    assert any("cost cap" in warning.lower() for warning in evidence.warnings)
+
+
+def test_analyze_with_llm_progress_logs_query_and_response(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Default progress reports both the outgoing call and the token usage."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    _install_stub_sdk(monkeypatch, json.dumps({"verdict": "x"}), {})
+    acd.analyze_with_llm(acd.CoreEvidence(), "claude-sonnet-4-6", 4000)
+    stderr = capsys.readouterr().err
+    assert "Querying" in stderr
+    assert "Response received" in stderr
+
+
+def test_analyze_with_llm_detail_logs_size_estimate(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """-v adds a rough evidence-size/token-estimate line before the call."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    _install_stub_sdk(monkeypatch, json.dumps({"verdict": "x"}), {})
+    acd.analyze_with_llm(acd.CoreEvidence(), "claude-sonnet-4-6", 4000, progress=False, detail=True)
+    stderr = capsys.readouterr().err
+    assert "est. input tokens" in stderr
+    assert "Querying" not in stderr
+
+
+# --------------------------------------------------------------------------- #
+# Progress, heartbeat and quiet/verbose logging flags
+# --------------------------------------------------------------------------- #
+
+
+def test_resolve_logging_flags_default_is_basic_progress_only() -> None:
+    """Progress is on by default; heartbeat/detail needs -v."""
+    assert acd.resolve_logging_flags(make_args()) == (True, False)
+
+
+def test_resolve_logging_flags_verbose_enables_detail() -> None:
+    """-v enables detail on top of the default progress."""
+    assert acd.resolve_logging_flags(make_args(verbose=True)) == (True, True)
+
+
+def test_resolve_logging_flags_quiet_wins_over_verbose() -> None:
+    """-q suppresses everything, even if -v is also passed."""
+    assert acd.resolve_logging_flags(make_args(quiet=True, verbose=True)) == (False, False)
+
+
+def test_run_gdb_phase_progress_prints_start_and_finish(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Basic phase progress prints by default, with no heartbeat needed."""
+    monkeypatch.setattr(
+        acd.subprocess, "run",
+        lambda *a, **k: types.SimpleNamespace(stdout="ok", stderr="", returncode=0),
+    )
+    acd.run_gdb_phase("gdb", Path("core.1"), None, "demo", [("x", "info x")], 10)
+    stderr = capsys.readouterr().err
+    assert "gdb phase 'demo' starting" in stderr
+    assert "gdb phase 'demo' completed" in stderr
+
+
+def test_run_gdb_phase_quiet_suppresses_progress(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """progress=False silences both the start/finish lines and the heartbeat."""
+    monkeypatch.setattr(
+        acd.subprocess, "run",
+        lambda *a, **k: types.SimpleNamespace(stdout="ok", stderr="", returncode=0),
+    )
+    acd.run_gdb_phase("gdb", Path("core.1"), None, "demo", [("x", "info x")], 10, progress=False, detail=True)
+    assert capsys.readouterr().err == ""
+
+
+def test_run_gdb_phase_detail_emits_heartbeat(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """detail=True surfaces a heartbeat while the (simulated) phase runs.
+
+    This is the actual fix for the reported "freezes with no output" issue:
+    a slow phase now prints liveness while it is still blocked in gdb.
+    """
+    def slow_run(*_args: Any, **_kwargs: Any) -> types.SimpleNamespace:
+        time.sleep(0.05)
+        return types.SimpleNamespace(stdout="ok", stderr="", returncode=0)
+
+    monkeypatch.setattr(acd.subprocess, "run", slow_run)
+    acd.run_gdb_phase(
+        "gdb", Path("core.1"), None, "demo", [("x", "info x")], 10,
+        progress=True, detail=True, heartbeat_interval=0.01,
+    )
+    assert "still running" in capsys.readouterr().err
+
+
+def test_collect_evidence_warns_on_large_core(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A core above --large-core-warning-mib gets an upfront slow-analysis note."""
+    core_path = tmp_path / "core.1"
+    core_path.touch()
+    os.truncate(core_path, 2 * 1024 * 1024)  # 2 MiB sparse file; no real disk write
+    monkeypatch.setattr(acd, "find_gdb", lambda explicit: "gdb")
+    monkeypatch.setattr(acd, "gdb_version", lambda path: "GNU gdb 15.1")
+    monkeypatch.setattr(
+        acd, "run_gdb_phase",
+        lambda *a, **k: acd.GdbPhaseResult(name="x", commands=[], stdout="", stderr=""),
+    )
+    monkeypatch.setattr(
+        acd, "resolve_executable",
+        lambda *a, **k: {"path": None, "resolved": False, "source": "none", "recorded": None, "notes": []},
+    )
+    args = make_args(core_file=str(core_path), large_core_warning_mib=1)
+    acd.collect_evidence(args, progress=True, detail=False)
+    assert "above 1 MiB" in capsys.readouterr().err
+
+
+def test_collect_evidence_quiet_suppresses_all_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """progress=False leaves stderr completely silent, for scripted use."""
+    core_path = tmp_path / "core.1"
+    core_path.write_bytes(b"x" * 10)
+    monkeypatch.setattr(acd, "find_gdb", lambda explicit: "gdb")
+    monkeypatch.setattr(acd, "gdb_version", lambda path: "GNU gdb 15.1")
+    monkeypatch.setattr(
+        acd, "run_gdb_phase",
+        lambda *a, **k: acd.GdbPhaseResult(name="x", commands=[], stdout="", stderr=""),
+    )
+    monkeypatch.setattr(
+        acd, "resolve_executable",
+        lambda *a, **k: {"path": None, "resolved": False, "source": "none", "recorded": None, "notes": []},
+    )
+    args = make_args(core_file=str(core_path))
+    acd.collect_evidence(args, progress=False, detail=False)
+    assert capsys.readouterr().err == ""
+
+
 # --------------------------------------------------------------------------- #
 # Phase plan and CLI
 # --------------------------------------------------------------------------- #
@@ -579,6 +783,20 @@ def test_parse_args_flags() -> None:
     """Flags are wired to the expected fields."""
     args = acd.parse_args(["core.1", "--no-llm", "--no-locals", "--mode", "hang", "--max-frames", "10"])
     assert args.no_llm is True and args.locals is False and args.mode == "hang" and args.max_frames == 10
+
+
+def test_parse_args_quiet_and_logging_defaults() -> None:
+    """-q defaults off; heartbeat/large-core defaults match the module constants."""
+    args = acd.parse_args(["core.1"])
+    assert args.quiet is False
+    assert args.heartbeat_interval == acd.DEFAULT_HEARTBEAT_INTERVAL
+    assert args.large_core_warning_mib == acd.DEFAULT_LARGE_CORE_WARNING_MIB
+
+
+def test_parse_args_quiet_flag() -> None:
+    """-q/--quiet is parsed."""
+    assert acd.parse_args(["core.1", "-q"]).quiet is True
+    assert acd.parse_args(["core.1", "--quiet"]).quiet is True
 
 
 def test_main_reports_missing_core_file(capsys: pytest.CaptureFixture[str]) -> None:
