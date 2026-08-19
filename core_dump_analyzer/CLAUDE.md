@@ -39,10 +39,9 @@ python analyze_core_dump.py /tmp/cores/core.crash.1234 --no-llm   # crash mode
 python analyze_core_dump.py /tmp/cores/core.hang.5678  --no-llm   # hang mode + py-bt
 ```
 
-Note: README.md refers to a `tests/` subdirectory (`tests/generate_test_cores.sh`,
-`pytest tests/`) and a `requirements-dev.txt`. Neither exists — the test file and
-the fixture generator both live at repo root, and `pytest` is the only extra dev
-dependency (not pinned in any requirements file).
+The test file and fixture generator both live at repository root; `pytest` is
+the only extra development dependency and is not pinned in a separate
+requirements file.
 
 ## Architecture
 
@@ -89,9 +88,10 @@ search is flagged in warnings.
 ### Evidence budgeting
 
 Athena-style jobs can have 100+ near-identical threads. `group_thread_stacks()`
-normalises and collapses identical backtraces into `ThreadGroup`s with counts;
-`_is_idle_stack()` flags stacks parked on condition variables/futexes/etc. so the
-model is told not to report them as findings. `enforce_global_budget()` is a
+normalises and collapses identical backtraces into `ThreadGroup`s with counts and
+`active` / `blocked` / `idle` state. A futex/condition-variable top frame is not
+sufficient to call a thread idle: deeper lock/shutdown/timeout frames can make it
+diagnostically blocked. `enforce_global_budget()` is a
 multi-stage shrink cascade (drop thread groups → shrink shared-library lists →
 shrink primary-thread locals/registers/args → shrink python backtrace/source →
 shrink primary backtrace) that runs when the serialized evidence exceeds
@@ -99,6 +99,32 @@ shrink primary backtrace) that runs when the serialized evidence exceeds
 `_cap_user_prompt()` is a hard failsafe (2x the evidence-char budget) applied to
 the actual outgoing prompt independently of the budget pass, so a future field
 addition can never send an unbounded prompt.
+
+### ATLAS container execution
+
+`collect_evidence()` dispatches between local execution and the explicit
+`--execution atlas-container` backend. Container mode stages a temporary copy of
+the analyzer and an analyzer-owned runner under the PanDA job directory, then
+uses `atlasLocalSetup.sh -c <platform> -s /srv/my_release_setup.sh -r /srv/<runner>`.
+It never executes `container_script.sh`. The worker runs evidence-only inside the
+container and returns JSON/raw GDB evidence to the host, where optional LLM
+synthesis still occurs.
+
+AnalysisBase `PYTHONHOME`/`PYTHONPATH` must never be inherited by GDB: EL9 GDB
+embeds Python 3.9 while AnalysisBase 25.2.103 uses Python 3.13.
+`gdb_subprocess_env()` removes those two variables and `run_gdb_phase()` also
+uses `-eiex 'set python ignore-environment on'`. Preserve both defenses.
+
+
+### Targeted thread inspection
+
+After `thread apply all bt`, `select_targeted_threads()` chooses a bounded number
+of representative non-idle thread groups and `_build_targeted_phase()` executes
+all selected `thread` / `frame` / `info frame` / `info args` / `info locals`
+commands in one additional GDB process. This is deliberately stack-based rather
+than thread-number-based. On the reference XRootD core it selects T3/F3, T2/F3,
+and T1/F2. Keep the dynamic section-marker support for digits because targeted
+sections are named `target_1_args`, etc.
 
 ### gdb output parsing
 
@@ -122,11 +148,62 @@ output and the API call.
 
 ## Known constraints worth preserving
 
-- Not yet validated against a real ATLAS/Athena core — only synthetic C/Python
-  fixtures from `generate_test_cores.sh`. Thread-group counts and frame budgets
-  are expected to need tuning once real cores are available.
+- The matching-container workflow and automated backend have been validated
+  against real PanDA core `core.53289` from job `7262157016` / AnalysisBase
+  25.2.103. The 0.2.2 targeted-frame phase was live-validated: it selects the intended T3/F3, T2/F3, and T1/F2 frames, but those optimized XRootD frames expose no `info args`/`info locals` data. Version 0.2.3 therefore treats that as a per-frame debug-detail limitation. Live 0.2.3 correlation showed that looping-job analysis must be payload-centric, leading to the 0.2.4 behavior below.
+- The first container backend requires the core and release setup to live under
+  the same `--job-dir` that ATLASLocalRootBase mounts at `/srv`.
 - Symbol quality dominates output quality; against a stripped/no-debuginfo binary
   the correct behavior is an "insufficient evidence" verdict, not a guess — this
   is deliberate prompt design, not a gap to fix.
-- Idle-thread detection (`_is_idle_stack()`) is a heuristic top-frame marker list
-  and won't recognise every framework's wait primitive.
+- Thread-state and context-frame selection are heuristic and won't recognise every
+  framework's wait/lock primitive. Preserve conservative wording and avoid turning
+  one stack snapshot into an unproven causal/deadlock claim.
+
+
+## Payload-log correlation (0.2.6+)
+
+When `--job-dir` is supplied, `collect_evidence()` augments the core evidence on
+the host with `evidence.job_logs`. In `--mode hang`, automatic discovery is
+payload-centric: `payload.stdout`, `payload.stderr`, and log-like files under
+`workDir` are scanned; `pilotlog.txt` is excluded unless explicitly supplied.
+This is intentional for looping jobs: pilot kill/timeout records are downstream
+reaction, while payload output and user logs describe the pre-core payload state.
+
+The collector stores payload-file mtime deltas from the core and a compact
+`payload_activity` summary, including the last retained progress line. Matchers
+are conservative: generic `root://`/`lsetup xrootd` text is not runtime XRootD
+evidence and identifiers like `EventErrorState` are not errors. Lower-case descriptive text such as `error state` must not be interpreted as an `ERROR` severity. Automatic `workDir` discovery must not accept arbitrary `.txt` files solely by suffix; prefer strong log-like names/suffixes and explicit `--job-log` for unusual text logs. Preserve the actual line-numbered payload tail because output after the last periodic progress counter can be the most diagnostic evidence. Keep this layer
+deterministic and do not infer causality beyond supported chronology.
+
+
+## Structured deterministic diagnosis (0.2.9)
+
+`CoreEvidence.diagnosis` is a downstream-integration contract, not an LLM verdict.
+Keep its rules conservative. A classification may identify the captured phase and
+component with high confidence while `root_cause_established` remains false.
+For the validated signature, successful payload completion plus
+`Py_Exit(sts=0)`/XRootD finalization yields
+`post-event-processing-shutdown-hang`; the same core signature without payload
+completion yields `shutdown-finalization-hang` at medium confidence. Unsupported
+states must remain `unclassified`. Preserve explicit `signals`,
+`supporting_evidence`, and `limitations` because Bamboo MCP should not have to
+reparse prose to recover these facts.
+
+## Latest validated state (0.2.9)
+
+- 135 tests pass.
+- Successful EventLoop completion is established before the XRootD shutdown hang for job 7262157016.
+- Live 0.2.6 validation retained all three XRootD thread groups with no evidence warnings and only current payload/runtime logs.
+- Hang-mode log discovery excludes stale workDir logs more than two hours older than the latest payload stream.
+- `--max-evidence-chars` reduces only a deep-copied LLM input; deterministic report/JSON evidence stays complete.
+
+
+## v0.2.8 notes
+
+Keep captured-process identity separate from symbol trust. Use the core-recorded command line to distinguish payload vs prmon; a GDB executable-match warning alone must never imply prmon. Zero checked Build IDs means unverified, not zero mismatches. Supported shutdown patterns include both XrdCl poller finalization and ROOT/TNetXNGFile remote-file close.
+
+
+## v0.2.9 family/subtype contract
+
+Both validated post-success XRootD shutdown signatures use family `post-event-processing-xrootd-shutdown-hang`. Subtype `poller-finalization` identifies the `DefaultEnv::Finalize/Poller::Stop` path; subtype `remote-file-close` identifies the `TROOT::CloseFiles/TNetXNGFile::Close` path. Preserve the detailed classification strings for compatibility.

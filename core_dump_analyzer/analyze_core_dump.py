@@ -31,11 +31,15 @@ that path automatically from the core's NT_FILE note before falling back to
 from __future__ import annotations
 
 import argparse
+import copy
+from collections import deque
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -43,7 +47,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-__version__ = "0.1.0"
+__version__ = "0.2.9"
 
 # --------------------------------------------------------------------------- #
 # Defaults
@@ -52,9 +56,18 @@ __version__ = "0.1.0"
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_MAX_FRAMES = 40
 DEFAULT_MAX_THREAD_GROUPS = 25
+DEFAULT_MAX_TARGETED_THREADS = 3
+DEFAULT_MAX_JOB_LOG_FILES = 12
+DEFAULT_MAX_JOB_LOG_MATCHES = 60
+DEFAULT_MAX_JOB_LOG_BYTES = 20 * 1024 * 1024
+DEFAULT_JOB_LOG_TAIL_LINES = 20
+DEFAULT_HANG_WORKDIR_LOG_RECENCY_S = 2 * 60 * 60
 DEFAULT_GDB_TIMEOUT = 120
 DEFAULT_MAX_TOKENS = 4000
 DEFAULT_MAX_EVIDENCE_CHARS = 50_000
+DEFAULT_CONTAINER_TIMEOUT = 1800
+DEFAULT_ATLAS_LOCAL_ROOT_BASE = "/cvmfs/atlas.cern.ch/repo/ATLASLocalRootBase"
+DEFAULT_ATLAS_PLATFORM = "el9"
 
 #: Seconds between "still running" heartbeat messages during a gdb phase.
 #: Only printed with --verbose; a phase producing no output for this long is
@@ -88,18 +101,30 @@ SECTION_LIMITS: dict[str, int] = {
     "python_backtrace": 8_000,
     "python_source": 3_000,
     "thread_group": 6_000,
+    "targeted_frame": 1_500,
+    "targeted_args": 2_000,
+    "targeted_locals": 3_000,
+    "job_log_line": 800,
 }
 
 #: Emitted by gdb's ``echo`` between commands so sections can be split exactly
 #: rather than guessed at with boundary regexes.
 SECTION_MARKER = "@@BAMBOO_SECTION:{name}@@"
-_MARKER_RE = re.compile(r"^@@BAMBOO_SECTION:([a-z_]+)@@\s*$", re.M)
+_MARKER_RE = re.compile(r"^@@BAMBOO_SECTION:([a-z0-9_]+)@@\s*$", re.M)
 
 #: Signals that indicate a genuine fault rather than a deliberate core dump.
 CRASH_SIGNALS = frozenset({"SIGSEGV", "SIGBUS", "SIGFPE", "SIGILL", "SIGSYS", "SIGTRAP"})
 
 #: Signals typically seen when a supervisor snapshots or kills a looping job.
 HANG_SIGNALS = frozenset({"SIGQUIT", "SIGABRT", "SIGTERM", "SIGKILL", "SIGUSR1", "SIGUSR2", "SIGINT"})
+
+#: Earliest possible gdb initialization. AnalysisBase exports PYTHONHOME/PYTHONPATH
+#: for its Python 3.13 runtime, while EL9 gdb embeds Python 3.9. This setting,
+#: together with sanitising those environment variables at process launch, keeps
+#: gdb's embedded Python from trying to import the wrong standard library.
+GDB_EARLY_INIT_COMMANDS: tuple[str, ...] = (
+    "set python ignore-environment on",
+)
 
 #: gdb settings applied before the core is loaded. Errors here are harmless on
 #: older gdb builds (the command is simply undefined) and are captured in stderr.
@@ -171,7 +196,10 @@ class ThreadGroup:
         thread_ids: gdb thread numbers belonging to the group (may be truncated).
         names: Distinct thread names observed in the group.
         backtrace: One representative backtrace for the group.
-        idle: Whether the top frame looks like a benign wait rather than work.
+        idle: Backwards-compatible flag indicating a genuinely benign idle wait.
+        state: ``"active"``, ``"blocked"``, or ``"idle"``. A thread blocked on
+            a synchronization primitive while executing meaningful shutdown, I/O,
+            or lock-acquisition code is ``"blocked"`` rather than ``"idle"``.
     """
 
     count: int
@@ -179,6 +207,7 @@ class ThreadGroup:
     names: list[str]
     backtrace: str
     idle: bool = False
+    state: str = "active"
 
 
 @dataclass
@@ -197,7 +226,11 @@ class CoreEvidence:
         warnings: Human-readable warnings about degraded evidence quality.
         primary_thread: Backtrace, args, locals, registers of the faulting thread.
         thread_groups: De-duplicated backtraces across all threads.
+        targeted_threads: Focused frame/args/locals evidence for selected non-idle threads.
         python: Python-level backtrace from ``py-bt``, if available.
+        job_logs: Bounded PanDA/payload log evidence correlated with the captured state.
+        process_identity: Conservative identification of whether the captured process is the payload, prmon, or unknown.
+        diagnosis: Conservative machine-readable deterministic diagnosis for downstream tools.
         shared_libraries: Summary of loaded libraries and missing symbols.
         phases: Raw metadata about each gdb invocation.
         truncated_sections: Names of sections shortened to fit the budget.
@@ -214,8 +247,16 @@ class CoreEvidence:
     warnings: list[str] = field(default_factory=list)
     primary_thread: dict[str, str] = field(default_factory=dict)
     thread_groups: list[ThreadGroup] = field(default_factory=list)
+    targeted_threads: list[dict[str, Any]] = field(default_factory=list)
+    observations: list[str] = field(default_factory=list)
+    job_logs: dict[str, Any] = field(default_factory=dict)
+    process_identity: dict[str, Any] = field(default_factory=dict)
+    diagnosis: dict[str, Any] = field(default_factory=dict)
     python: dict[str, Any] = field(default_factory=dict)
     shared_libraries: dict[str, Any] = field(default_factory=dict)
+    build_ids: dict[str, Any] = field(default_factory=dict)
+    environment: dict[str, Any] = field(default_factory=dict)
+    gdb_metadata: dict[str, Any] = field(default_factory=dict)
     phases: list[dict[str, Any]] = field(default_factory=list)
     truncated_sections: list[str] = field(default_factory=list)
 
@@ -380,8 +421,22 @@ def find_gdb(explicit: str | None) -> str:
     return candidate
 
 
+def gdb_subprocess_env() -> dict[str, str]:
+    """Return a copy of the environment safe for gdb's embedded Python.
+
+    AnalysisBase commonly exports ``PYTHONHOME`` and ``PYTHONPATH`` for its
+    Python runtime. EL9 gdb embeds a different Python version, so inheriting
+    those variables can make gdb fail before it processes any commands. Other
+    release variables, especially ``PATH`` and ``LD_LIBRARY_PATH``, are kept.
+    """
+    env = os.environ.copy()
+    env.pop("PYTHONHOME", None)
+    env.pop("PYTHONPATH", None)
+    return env
+
+
 def gdb_version(gdb_path: str) -> str:
-    """Return the first line of ``gdb --version``.
+    """Return the first line of ``gdb --version`` using a sanitized environment.
 
     Args:
         gdb_path: Path to the gdb executable.
@@ -391,7 +446,8 @@ def gdb_version(gdb_path: str) -> str:
     """
     try:
         proc = subprocess.run(
-            [gdb_path, "--version"], capture_output=True, text=True, timeout=30, check=False
+            [gdb_path, "--version"], capture_output=True, text=True, timeout=30, check=False,
+            env=gdb_subprocess_env(),
         )
         return proc.stdout.splitlines()[0].strip() if proc.stdout else "unknown"
     except (OSError, subprocess.SubprocessError, IndexError):
@@ -453,6 +509,8 @@ def run_gdb_phase(
         A :class:`GdbPhaseResult` describing the invocation.
     """
     argv: list[str] = [gdb_path, "-q", "-nx", "-batch"]
+    for setting in GDB_EARLY_INIT_COMMANDS:
+        argv += ["-eiex", setting]
     for setting in GDB_INIT_COMMANDS:
         argv += ["-iex", setting]
     if exe_path:
@@ -475,7 +533,9 @@ def run_gdb_phase(
 
     timed_out = False
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout, check=False, env=gdb_subprocess_env()
+        )
         stdout = proc.stdout or ""
         result = GdbPhaseResult(
             name=name,
@@ -654,39 +714,31 @@ def resolve_executable(gdb_path: str, core_path: Path, explicit: str | None,
     """Determine which ELF binary gdb should load alongside the core.
 
     Resolution order is ``--exe``, then ``AT_EXECFN`` from the auxiliary vector,
-    then the core's NT_FILE note, then the recorded command line. A ``.py`` path
-    passed via ``--exe`` is rejected, because gdb needs the interpreter binary
-    rather than the script.
-
-    Args:
-        gdb_path: Path to the gdb executable.
-        core_path: Path to the core dump file.
-        explicit: User-supplied executable path, or ``None``.
-        probe_output: Output of a bare ``gdb -c core`` probe run.
-        timeout: gdb timeout in seconds.
-        progress: Whether to print progress for any gdb probe this triggers.
-        detail: Whether to also print heartbeat messages during those probes.
-        heartbeat_interval: Seconds between heartbeat messages when ``detail``
-            is enabled.
-
-    Returns:
-        A dictionary with keys ``path``, ``resolved``, ``source``, ``recorded``
-        and ``notes``.
+    then the core's NT_FILE note, then the recorded command line. Failed automatic
+    candidates are recorded as attempts but do not become user-facing warnings if
+    a later candidate resolves successfully. This avoids stale warnings such as a
+    truncated ``AT_EXECFN`` path surviving after command-line resolution succeeds.
     """
-    notes: list[str] = []
+    persistent_notes: list[str] = []
+    failed_notes: list[str] = []
+    attempts: list[dict[str, Any]] = []
 
     if explicit:
         explicit_path = Path(explicit)
         if explicit_path.suffix == ".py":
-            notes.append(
+            persistent_notes.append(
                 f"--exe pointed at a Python script ({explicit}). gdb needs the interpreter ELF binary, "
                 "not the script; ignoring it and attempting automatic resolution."
             )
+            attempts.append({"source": "--exe", "recorded": explicit, "resolved": False, "reason": "python-script"})
         elif not explicit_path.is_file():
-            notes.append(f"--exe path does not exist: {explicit}")
+            persistent_notes.append(f"--exe path does not exist: {explicit}")
+            attempts.append({"source": "--exe", "recorded": explicit, "resolved": False, "reason": "missing"})
         else:
-            return {"path": str(explicit_path.resolve()), "resolved": True,
-                    "source": "--exe", "recorded": None, "notes": notes}
+            resolved = str(explicit_path.resolve())
+            attempts.append({"source": "--exe", "recorded": explicit, "resolved": True, "path": resolved})
+            return {"path": resolved, "resolved": True, "source": "--exe",
+                    "recorded": None, "notes": persistent_notes, "attempts": attempts}
 
     candidates: list[tuple[str, str | None]] = [
         ("AT_EXECFN", executable_from_auxv(
@@ -696,9 +748,13 @@ def resolve_executable(gdb_path: str, core_path: Path, explicit: str | None,
     ]
     for source, recorded in candidates:
         if not recorded:
+            attempts.append({"source": source, "recorded": None, "resolved": False, "reason": "not-found-in-core"})
             continue
         resolved, searched = _existing_path(recorded)
         if resolved:
+            attempts.append({"source": source, "recorded": recorded, "resolved": True,
+                             "path": resolved, "searched": searched})
+            notes = list(persistent_notes)
             if searched:
                 notes.append(
                     f"Executable recorded as '{recorded}' was not found directly and was matched to "
@@ -706,16 +762,131 @@ def resolve_executable(gdb_path: str, core_path: Path, explicit: str | None,
                     "plausible but wrong symbols."
                 )
             return {"path": resolved, "resolved": True, "source": source,
-                    "recorded": recorded, "notes": notes}
-        notes.append(
+                    "recorded": recorded, "notes": notes, "attempts": attempts}
+        attempts.append({"source": source, "recorded": recorded, "resolved": False, "reason": "missing"})
+        failed_notes.append(
             f"The core references executable '{recorded}' ({source}), which is not present on this host. "
             "No substitute was used, because a different build would produce misleading symbols. "
             "Re-run where that path is available (for ATLAS jobs, with the matching CVMFS release mounted), "
             "or pass the correct binary with --exe."
         )
 
+    notes = persistent_notes + failed_notes
     notes.append("No executable could be resolved. Backtraces will be unsymbolised and largely uninterpretable.")
-    return {"path": None, "resolved": False, "source": "none", "recorded": None, "notes": notes}
+    return {"path": None, "resolved": False, "source": "none", "recorded": None,
+            "notes": notes, "attempts": attempts}
+
+
+CRITICAL_BUILD_ID_BASENAMES = frozenset({"libc.so.6", "libm.so.6", "ld-linux-x86-64.so.2"})
+
+
+def collect_runtime_environment() -> dict[str, Any]:
+    """Collect a small deterministic description of the current analysis OS."""
+    os_release: dict[str, str] = {}
+    try:
+        for line in Path("/etc/os-release").read_text(encoding="utf-8", errors="replace").splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os_release[key] = value.strip().strip('"')
+    except OSError:
+        pass
+
+    glibc = "unknown"
+    ldd = shutil.which("ldd")
+    if ldd:
+        try:
+            proc = subprocess.run([ldd, "--version"], capture_output=True, text=True, timeout=15, check=False)
+            first = (proc.stdout or proc.stderr or "").splitlines()
+            if first:
+                glibc = first[0].strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return {
+        "execution_backend": "local",
+        "os": os_release.get("PRETTY_NAME") or os_release.get("NAME") or "unknown",
+        "os_id": os_release.get("ID"),
+        "os_version": os_release.get("VERSION_ID"),
+        "glibc": glibc,
+    }
+
+
+def parse_eu_unstrip_modules(text: str) -> list[dict[str, str]]:
+    """Parse ``eu-unstrip -n --core`` module lines into compact records."""
+    modules: list[dict[str, str]] = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 3 or "+0x" not in parts[0] or "@0x" not in parts[1]:
+            continue
+        build_id = parts[1].split("@", 1)[0]
+        path = next((part for part in parts[2:] if part.startswith("/")), "")
+        name = Path(path).name if path else parts[-1]
+        modules.append({"build_id": build_id, "path": path, "name": name, "mapping": parts[0]})
+    return modules
+
+
+def file_build_id(path: str) -> str | None:
+    """Read an ELF Build ID from a file using an available readelf implementation."""
+    if not path or not Path(path).is_file():
+        return None
+    tool = shutil.which("eu-readelf") or shutil.which("readelf")
+    if not tool:
+        return None
+    try:
+        proc = subprocess.run([tool, "-n", path], capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"Build ID:\s*([0-9a-fA-F]+)", (proc.stdout or "") + "\n" + (proc.stderr or ""))
+    return match.group(1).lower() if match else None
+
+
+def collect_build_id_evidence(core_path: Path, exe_path: str | None) -> tuple[dict[str, Any], str]:
+    """Collect core module Build IDs and compare key files on the analysis host."""
+    tool = shutil.which("eu-unstrip")
+    if not tool:
+        return {"available": False, "reason": "eu-unstrip not found"}, ""
+    try:
+        proc = subprocess.run(
+            [tool, "-n", "--core", str(core_path)], capture_output=True, text=True, timeout=120, check=False
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"available": False, "reason": f"eu-unstrip failed: {exc}"}, ""
+    raw = (proc.stdout or "") + (proc.stderr or "")
+    modules = parse_eu_unstrip_modules(proc.stdout or "")
+    selected: list[dict[str, Any]] = []
+    exe_resolved = str(Path(exe_path).resolve()) if exe_path and Path(exe_path).is_file() else exe_path
+    for module in modules:
+        path = module.get("path", "")
+        name = module.get("name", "")
+        is_executable = bool(
+            exe_path and path
+            and (path == exe_path or (exe_resolved and str(Path(path).resolve()) == exe_resolved))
+        )
+        if name not in CRITICAL_BUILD_ID_BASENAMES and not is_executable:
+            continue
+        disk_id = file_build_id(path)
+        core_id = module["build_id"].lower()
+        selected.append({
+            "name": name,
+            "path": path,
+            "role": "executable" if is_executable else "system-library",
+            "core_build_id": core_id,
+            "file_build_id": disk_id,
+            "file_present": bool(path and Path(path).is_file()),
+            "match": (disk_id == core_id) if disk_id else None,
+        })
+    mismatches = [item for item in selected if item.get("match") is False]
+    unavailable = [item for item in selected if item.get("match") is None]
+    return {
+        "available": proc.returncode == 0 or bool(modules),
+        "tool": tool,
+        "module_count": len(modules),
+        "checked": selected,
+        "mismatch_count": len(mismatches),
+        "unverified_count": len(unavailable),
+        "coverage": "verified" if selected and not mismatches and not unavailable else ("partial" if selected else "unverified"),
+        "raw_excerpt": raw[:2000] if len(modules) < 4 else "",
+    }, raw
 
 
 # --------------------------------------------------------------------------- #
@@ -762,7 +933,6 @@ def collect_warnings(text: str) -> list[str]:
     checks = (
         ("is truncated", "The core file is truncated (likely a `ulimit -c` cap). Deep frames may be missing or wrong."),
         ("core file may not match", "gdb reports the core may not match the executable. Symbols may be misleading."),
-        ("No symbol table info available", "Some frames have no symbol information."),
         ("no debugging symbols found", "The executable was built or shipped without debug symbols."),
         ("Missing separate debuginfo", "Separate debuginfo packages are missing for one or more libraries."),
         ("Cannot access memory", "Parts of the process memory are unreadable in this core."),
@@ -773,23 +943,854 @@ def collect_warnings(text: str) -> list[str]:
     return warnings
 
 
-def _is_idle_stack(backtrace: str) -> bool:
-    """Heuristically decide whether a stack is waiting rather than working.
+def _classify_thread_stack(backtrace: str) -> str:
+    """Classify a thread stack as active, blocked, or genuinely idle.
 
-    Args:
-        backtrace: The backtrace text for one thread.
+    A top-level futex/condition-variable wait does *not* by itself mean a thread
+    is uninteresting. In hang cores, the thread we care about is often blocked
+    in exactly such a primitive while a deeper frame shows a shutdown handshake,
+    mutex acquisition, timeout handler, or other meaningful operation.
 
     Returns:
-        ``True`` if the top frames look like a benign blocking wait.
+        ``"active"`` when the top frames are not a known wait, ``"blocked"``
+        when they are waiting in a meaningful blocking context, otherwise
+        ``"idle"`` for a benign parked worker.
     """
-    idle_markers = (
+    wait_markers = (
         "pthread_cond_wait", "pthread_cond_timedwait", "__futex_abstimed_wait",
         "epoll_wait", "poll (", "ppoll", "select (", "nanosleep", "sem_wait",
-        "sigwait", "accept (", "read (", "recvmsg",
+        "sigwait", "accept (", "read (", "recvmsg", "XrdSysCondVar::Wait",
     )
-    head = "\n".join(backtrace.splitlines()[:3])
-    return any(marker in head for marker in idle_markers)
+    frames = [line for line in backtrace.splitlines() if line.lstrip().startswith("#")]
+    head = "\n".join(frames[:3])
+    if not any(marker in head for marker in wait_markers):
+        return "active"
 
+    # These contexts make a blocking primitive diagnostically meaningful rather
+    # than a benign worker wait. The list intentionally mixes generic lock/exit
+    # patterns with XRootD shutdown/timeout operations seen in ATLAS jobs.
+    blocking_context_markers = (
+        "pthread_mutex_lock", "__lll_lock_wait", "std::mutex::lock",
+        "::Lock(", "::SendCmd(", "::Stop(", "::Finalize(",
+        "::ShutdownEvents(", "::ForceDisconnect(", "::ForceError(",
+        "::OnReadTimeout(", "Py_Exit (", "__run_exit_handlers",
+    )
+    if any(marker in backtrace for marker in blocking_context_markers):
+        return "blocked"
+    return "idle"
+
+
+def _is_idle_stack(backtrace: str) -> bool:
+    """Return whether a stack is a genuinely benign parked-worker wait.
+
+    Kept as a small compatibility wrapper for callers/tests that used the
+    original boolean classifier.
+    """
+    return _classify_thread_stack(backtrace) == "idle"
+
+
+def _thread_context_frame(backtrace: str) -> str:
+    """Return the most useful single frame for a compact thread summary."""
+    frames = [line.strip() for line in backtrace.splitlines() if line.lstrip().startswith("#")]
+    if not frames:
+        return "?"
+    preferred = (
+        "::OnReadTimeout(", "::ForceDisconnect(", "::ShutdownEvents(",
+        "::StreamMutex::Lock(", "::SendCmd(", "::Stop(", "::Finalize(",
+        "Py_Exit (", "pthread_mutex_lock", "__lll_lock_wait",
+    )
+    for line in frames:
+        if any(marker in line for marker in preferred):
+            return line
+    generic = (
+        "__futex_abstimed_wait", "pthread_cond_wait", "XrdSysCondVar::Wait",
+        "start_thread", "clone3",
+    )
+    for line in frames[1:]:
+        if not any(marker in line for marker in generic):
+            return line
+    return frames[0]
+
+
+def _frame_number(frame_line: str) -> int | None:
+    """Extract a numeric gdb frame index from a rendered ``#N`` frame line."""
+    match = re.match(r"^#(\d+)\b", frame_line.strip())
+    return int(match.group(1)) if match else None
+
+
+def select_targeted_threads(thread_groups: list[ThreadGroup], max_targets: int) -> list[dict[str, Any]]:
+    """Select representative non-idle threads for focused frame inspection.
+
+    One representative is chosen from each interesting thread group.  The
+    context-frame heuristic is the same one used by the compact report, so the
+    detailed evidence explains exactly the frame the operator sees highlighted.
+    """
+    if max_targets <= 0:
+        return []
+    targets: list[dict[str, Any]] = []
+    for group in thread_groups:
+        if group.state == "idle" or not group.thread_ids:
+            continue
+        context = _thread_context_frame(group.backtrace)
+        frame_no = _frame_number(context)
+        if frame_no is None:
+            continue
+        targets.append({
+            "thread_id": group.thread_ids[0],
+            "state": group.state,
+            "frame": frame_no,
+            "context": context,
+        })
+        if len(targets) >= max_targets:
+            break
+    return targets
+
+
+def _build_targeted_phase(targets: list[dict[str, Any]], include_locals: bool) -> list[tuple[str, str]]:
+    """Build one batched gdb phase for the selected thread/frame pairs."""
+    commands: list[tuple[str, str]] = []
+    for index, target in enumerate(targets, start=1):
+        prefix = f"target_{index}"
+        commands.extend([
+            (f"{prefix}_thread", f"thread {target['thread_id']}"),
+            (f"{prefix}_frame_select", f"frame {target['frame']}"),
+            (f"{prefix}_frame", "info frame"),
+            (f"{prefix}_args", "info args"),
+        ])
+        if include_locals:
+            commands.append((f"{prefix}_locals", "info locals"))
+    return commands
+
+
+def summarise_targeted_threads(targets: list[dict[str, Any]], sections: dict[str, str],
+                               redact_enabled: bool) -> list[dict[str, Any]]:
+    """Attach bounded ``info frame/args/locals`` output to targeted thread metadata.
+
+    ``info sharedlibrary`` saying ``Yes`` only means that GDB read symbols for
+    the DSO; an optimized function can still lack usable argument/local DWARF.
+    Record that distinction explicitly so the report does not imply that the
+    whole library is unsymbolized when only frame-local detail is unavailable.
+    """
+    summaries: list[dict[str, Any]] = []
+    unavailable_marker = "No symbol table info available."
+    for index, target in enumerate(targets, start=1):
+        prefix = f"target_{index}"
+        item = dict(target)
+        detail_available = False
+        for key, limit_name in (("frame_info", "targeted_frame"),
+                                ("args", "targeted_args"),
+                                ("locals", "targeted_locals")):
+            section_key = f"{prefix}_{'frame' if key == 'frame_info' else key}"
+            body = sections.get(section_key, "").strip()
+            if body:
+                item[key], _ = truncate(redact(body, redact_enabled), SECTION_LIMITS[limit_name])
+                if key in {"args", "locals"} and unavailable_marker not in body:
+                    detail_available = True
+        item["frame_details_available"] = detail_available
+        summaries.append(item)
+    return summaries
+
+
+
+JOB_LOG_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("termination", re.compile(
+        r"\b(SystemExit|SIGTERM|SIGQUIT|SIGKILL|killed|kill signal|payload.*(?:exit|finished)|exit code|walltime|looping job)\b",
+        re.I,
+    )),
+    # Runtime I/O evidence only.  Generic mentions such as `lsetup xrootd` or
+    # `root://` entries in a catalog describe configuration/input locations,
+    # not an observed XRootD failure in the payload.
+    ("xrootd", re.compile(
+        r"(?:\bXrd(?:Cl|Sys)::|\bread timeout\b|\boperation expired\b|\bforce(?:d)? disconnect\b|"
+        r"\bXRootD\b.*\b(?:error|timeout|fail(?:ed|ure)?)\b)",
+        re.I,
+    )),
+    # Severity words are intentionally case-sensitive here.  Payload text can
+    # legitimately contain phrases such as "without any error state set";
+    # treating every lower-case word "error" as a log severity creates false
+    # positives.  Exception/traceback markers remain case-insensitive.
+    ("error", re.compile(
+        r"(?:^|[\s|])(?:FATAL|ERROR)(?=[\s:|]|$)|(?:^|[\s|])(?:Fatal|Error):|(?i:\b(?:exception|traceback)\b)",
+    )),
+    ("completion", re.compile(
+        r"\bworker finished successfully\b|\bcurrent job status:\s*\d+\s+success,\s*0\s+failure|"
+        r"\bMoving the analysis root file\b|\brenaming .*output\.root\b",
+        re.I,
+    )),
+    ("progress", re.compile(
+        r"\b(events? processed|processed .*events?|accepted \d+ out of \d+ events|"
+        r"finali[sz](?:e|ing|ation)|closing .*file|output .*file|write .*output)\b",
+        re.I,
+    )),
+)
+
+
+def _log_role(path: Path, job_dir: Path) -> str:
+    """Return a stable evidence role for a discovered payload/job log."""
+    try:
+        rel = path.relative_to(job_dir)
+    except ValueError:
+        rel = path
+    name = path.name.lower()
+    if len(rel.parts) == 1 and name == "payload.stdout":
+        return "payload-stdout"
+    if len(rel.parts) == 1 and name == "payload.stderr":
+        return "payload-stderr"
+    if len(rel.parts) == 1 and name == "pilotlog.txt":
+        return "pilot"
+    if rel.parts and rel.parts[0] == "workDir":
+        return "workdir-log"
+    if "payload" in name:
+        return "payload-log"
+    return "other"
+
+
+def _job_log_rank(path: Path, job_dir: Path, core_mtime: float | None = None) -> tuple[int, float, str]:
+    """Rank payload streams and recent workDir logs ahead of incidental files."""
+    role = _log_role(path, job_dir)
+    role_rank = {
+        "payload-stdout": 0,
+        "payload-stderr": 0,
+        "payload-log": 1,
+        "workdir-log": 2,
+        "pilot": 3,
+        "other": 9,
+    }.get(role, 9)
+    recency = float("inf")
+    if core_mtime is not None:
+        try:
+            recency = abs(path.stat().st_mtime - core_mtime)
+        except OSError:
+            pass
+    return (role_rank, recency, str(path))
+
+
+def _looks_like_log_file(path: Path) -> bool:
+    """Conservatively identify runtime log artifacts by name/suffix.
+
+    A bare ``.txt`` suffix is not enough: PanDA work directories commonly
+    contain input lists, path/configuration files, and other static text.
+    Arbitrarily named text logs can still be supplied explicitly with
+    ``--job-log``.
+    """
+    name = path.name.lower()
+    suffix = path.suffix.lower()
+    if suffix in {".log", ".out", ".err", ".stdout", ".stderr"}:
+        return True
+    return any(token in name for token in ("log", "stdout", "stderr", "trace", "debug", "report"))
+
+
+def discover_job_logs(job_dir: Path, explicit: Sequence[str] | None = None,
+                      max_files: int = DEFAULT_MAX_JOB_LOG_FILES,
+                      failure_mode: str = "auto",
+                      core_mtime: float | None = None) -> list[Path]:
+    """Discover bounded payload-centric logs for a core-analysis failure mode.
+
+    For looping/hang jobs the pilot's own log is deliberately excluded from
+    automatic discovery: pilot termination records describe what the pilot did
+    *after* deciding the payload was looping, not what the payload was doing
+    before the core was captured.  The primary automatic sources are the
+    payload stdout/stderr streams plus user/payload-generated log-like files
+    below ``workDir``.  ``--job-log`` remains an explicit escape hatch for any
+    other file, including ``pilotlog.txt``.
+    """
+    candidates: list[Path] = []
+    if explicit:
+        for raw in explicit:
+            path = Path(raw).expanduser()
+            if not path.is_absolute():
+                path = job_dir / path
+            if path.is_file():
+                candidates.append(path.resolve())
+    else:
+        generated_prefixes = ("core-analysis", ".core_dump_analyzer_")
+
+        # Canonical payload streams live at the job root.
+        for name in ("payload.stdout", "payload.stderr"):
+            path = job_dir / name
+            if path.is_file():
+                candidates.append(path.resolve())
+        for path in job_dir.glob("payload*"):
+            if path.is_file() and _looks_like_log_file(path):
+                candidates.append(path.resolve())
+
+        # User/payload-created logs are expected below workDir.  Search them
+        # recursively but only retain log-like text artifacts; build products
+        # and payload data files are intentionally ignored.  For hang analysis
+        # we additionally prefer files active near the end of the payload: a
+        # job tarball can contain old reference/test logs copied into workDir,
+        # and their ERROR lines are not evidence about this execution.
+        payload_mtimes: list[float] = []
+        for payload_name in ("payload.stdout", "payload.stderr"):
+            payload_path = job_dir / payload_name
+            try:
+                if payload_path.is_file() and payload_path.stat().st_size > 0:
+                    payload_mtimes.append(payload_path.stat().st_mtime)
+            except OSError:
+                pass
+        latest_payload_mtime = max(payload_mtimes, default=None)
+
+        work_dir = job_dir / "workDir"
+        if work_dir.is_dir():
+            for path in work_dir.rglob("*"):
+                if not path.is_file() or not _looks_like_log_file(path):
+                    continue
+                try:
+                    rel_work = path.relative_to(work_dir)
+                except ValueError:
+                    continue
+                # The unpacked user release can live below workDir/usr and may
+                # contain thousands of build/configuration .txt files.  Those
+                # are not runtime logs and must not crowd payload-created files
+                # out of the bounded discovery set.
+                if rel_work.parts and rel_work.parts[0] == "usr":
+                    continue
+                name = path.name.lower()
+                if name.startswith(generated_prefixes):
+                    continue
+                if failure_mode == "hang" and latest_payload_mtime is not None:
+                    try:
+                        if path.stat().st_mtime < latest_payload_mtime - DEFAULT_HANG_WORKDIR_LOG_RECENCY_S:
+                            continue
+                    except OSError:
+                        continue
+                candidates.append(path.resolve())
+
+        # Pilot evidence can still be useful for non-looping failures, but not
+        # for an explicitly diagnosed hang/loop.
+        if failure_mode != "hang":
+            pilot = job_dir / "pilotlog.txt"
+            if pilot.is_file():
+                candidates.append(pilot.resolve())
+
+    unique = list(dict.fromkeys(candidates))
+    unique.sort(key=lambda path: _job_log_rank(path, job_dir, core_mtime))
+    return unique[:max(0, max_files)]
+
+
+def _format_duration(seconds: float) -> str:
+    """Format a non-negative duration compactly for evidence-only reports."""
+    total = max(0, int(round(seconds)))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts: list[str] = []
+    if hours:
+        parts.append(f"{hours}h")
+    if hours or minutes:
+        parts.append(f"{minutes:02d}m" if hours else f"{minutes}m")
+    parts.append(f"{secs:02d}s" if hours or minutes else f"{secs}s")
+    return " ".join(parts)
+
+
+def collect_job_log_evidence(job_dir: Path, explicit: Sequence[str] | None = None,
+                             max_files: int = DEFAULT_MAX_JOB_LOG_FILES,
+                             max_matches: int = DEFAULT_MAX_JOB_LOG_MATCHES,
+                             max_bytes: int = DEFAULT_MAX_JOB_LOG_BYTES,
+                             tail_lines: int = DEFAULT_JOB_LOG_TAIL_LINES,
+                             redact_enabled: bool = True,
+                             core_mtime: float | None = None,
+                             failure_mode: str = "auto") -> dict[str, Any]:
+    """Extract bounded payload/runtime evidence near the captured core state.
+
+    Hang-mode collection is payload-centric: canonical payload stdout/stderr
+    and log-like files under ``workDir`` are scanned automatically, while the
+    pilot log is excluded unless supplied explicitly.  Large logs are searched
+    in a tail window because the last payload activity before a loop is usually
+    the most useful.  Matches are bounded per file so one noisy log cannot
+    evict evidence from all other payload-generated logs.
+    """
+    files = discover_job_logs(
+        job_dir, explicit=explicit, max_files=max_files,
+        failure_mode=failure_mode, core_mtime=core_mtime,
+    )
+    result: dict[str, Any] = {
+        "available": bool(files),
+        "job_dir": str(job_dir),
+        "profile": "payload-centric" if failure_mode == "hang" else "general",
+        "pilotlog_default_excluded": failure_mode == "hang" and not explicit,
+        "files": [],
+        "matches": [],
+        "category_counts": {},
+        "category_counts_found": {},
+        "tail_lines_per_file": max(0, tail_lines),
+    }
+    if failure_mode == "hang" and not explicit:
+        result["workdir_recency_window_s"] = DEFAULT_HANG_WORKDIR_LOG_RECENCY_S
+    if not files or max_matches <= 0:
+        result["match_limit_reached"] = False
+        return result
+
+    per_file_limit = max(4, (max_matches + len(files) - 1) // len(files))
+    all_matches: list[dict[str, Any]] = []
+    found_counts: dict[str, int] = {}
+    total_found = 0
+
+    for path in files:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        window_start = max(0, stat.st_size - max_bytes)
+        line_base = 0
+        try:
+            with path.open("rb") as handle:
+                remaining = window_start
+                while remaining > 0:
+                    chunk = handle.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    line_base += chunk.count(b"\n")
+                    remaining -= len(chunk)
+                if window_start:
+                    partial = handle.readline()
+                    line_base += 1
+                    scanned = handle.read(max(0, max_bytes - len(partial)))
+                else:
+                    scanned = handle.read(max_bytes)
+        except OSError:
+            continue
+
+        try:
+            rel = str(path.relative_to(job_dir))
+        except ValueError:
+            rel = path.name
+        role = _log_role(path, job_dir)
+        meta = {
+            "path": str(path),
+            "relative_path": rel,
+            "role": role,
+            "size_bytes": stat.st_size,
+            "scanned_bytes": len(scanned),
+            "window": "tail" if window_start else "full",
+            "truncated": bool(window_start),
+            "modified": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stat.st_mtime)),
+        }
+        if core_mtime is not None:
+            meta["mtime_delta_from_core_s"] = round(stat.st_mtime - core_mtime, 3)
+        result["files"].append(meta)
+
+        text = scanned.decode("utf-8", errors="replace")
+
+        # Preserve the actual end of runtime output independently of keyword
+        # matching.  For looping jobs this is often more diagnostic than the
+        # latest periodic "Processed N events" line because shutdown/finalize
+        # messages can follow the last progress counter.
+        if tail_lines > 0 and role in {"payload-stdout", "payload-stderr", "payload-log", "workdir-log"}:
+            tail: deque[dict[str, Any]] = deque(maxlen=tail_lines)
+            for relative_line, line in enumerate(text.splitlines(), start=1):
+                clean = line.strip()
+                if not clean:
+                    continue
+                bounded, _ = truncate(redact(clean, redact_enabled), SECTION_LIMITS["job_log_line"])
+                tail.append({"line": line_base + relative_line, "text": bounded})
+            if tail:
+                meta["tail"] = list(tail)
+
+        recent: deque[dict[str, Any]] = deque(maxlen=per_file_limit)
+        for relative_line, line in enumerate(text.splitlines(), start=1):
+            clean = line.strip()
+            if not clean:
+                continue
+            for category, pattern in JOB_LOG_PATTERNS:
+                if not pattern.search(clean):
+                    continue
+                bounded, _ = truncate(redact(clean, redact_enabled), SECTION_LIMITS["job_log_line"])
+                recent.append({
+                    "file": str(path),
+                    "relative_file": rel,
+                    "role": role,
+                    "line": line_base + relative_line,
+                    "category": category,
+                    "text": bounded,
+                })
+                found_counts[category] = found_counts.get(category, 0) + 1
+                total_found += 1
+                break
+        all_matches.extend(recent)
+
+    retained = all_matches[:max_matches]
+    retained_counts: dict[str, int] = {}
+    for item in retained:
+        category = str(item.get("category", "other"))
+        retained_counts[category] = retained_counts.get(category, 0) + 1
+    result["matches"] = retained
+    result["category_counts"] = retained_counts
+    result["category_counts_found"] = found_counts
+    result["matched_lines_found"] = total_found
+    result["match_limit_reached"] = total_found > len(retained)
+
+    # Filesystem modification time is valuable deterministic evidence for a
+    # looping job even when the payload log itself has no timestamps.  Record
+    # the latest observed payload-stream write before the core and the most
+    # recent retained progress line from that stream.
+    payload_files = [
+        meta for meta in result["files"]
+        if meta.get("role") in {"payload-stdout", "payload-stderr", "payload-log"}
+        and meta.get("size_bytes", 0) > 0
+        and isinstance(meta.get("mtime_delta_from_core_s"), (int, float))
+        and meta["mtime_delta_from_core_s"] <= 0
+    ]
+    if payload_files:
+        latest = max(payload_files, key=lambda meta: meta["mtime_delta_from_core_s"])
+        silence_s = abs(float(latest["mtime_delta_from_core_s"]))
+        progress_matches = [
+            item for item in retained
+            if item.get("category") == "progress"
+            and item.get("role") in {"payload-stdout", "payload-stderr", "payload-log"}
+        ]
+        latest_progress = max(progress_matches, key=lambda item: int(item.get("line", 0)), default=None)
+        activity: dict[str, Any] = {
+            "latest_payload_file": latest.get("relative_path", Path(str(latest.get("path", ""))).name),
+            "last_write_before_core_s": round(silence_s, 3),
+            "last_write_before_core_human": _format_duration(silence_s),
+        }
+        latest_tail = latest.get("tail")
+        if isinstance(latest_tail, list) and latest_tail:
+            activity["last_nonempty_line"] = latest_tail[-1]
+            activity["tail"] = latest_tail
+        if latest_progress:
+            activity["latest_progress"] = latest_progress
+        result["payload_activity"] = activity
+
+    return result
+
+
+def derive_payload_log_observations(job_logs: dict[str, Any], primary_backtrace: str) -> list[str]:
+    """Derive conservative completion/shutdown observations from payload tails.
+
+    The payload tail is more reliable than filename heuristics for deciding
+    whether a looping job was still in event processing.  These observations
+    intentionally describe ordering/state only; they do not claim which XRootD
+    lock or timeout caused the shutdown hang.
+    """
+    activity = job_logs.get("payload_activity", {}) if isinstance(job_logs, dict) else {}
+    tail = activity.get("tail", []) if isinstance(activity, dict) else []
+    tail_text = "\n".join(str(item.get("text", "")) for item in tail if isinstance(item, dict))
+    observations: list[str] = []
+
+    worker_success = "worker finished successfully" in tail_text
+    job_success = bool(re.search(r"current job status:\s*\d+\s+success,\s*0\s+failure", tail_text, re.I))
+    output_postprocessing = bool(re.search(
+        r"Moving the analysis root file|Moving .*hist-output|renaming .*output\.root", tail_text, re.I
+    ))
+    clean_python_exit = "Py_Exit (sts=0)" in primary_backtrace
+    xrootd_finalize = "XrdCl::DefaultEnv::Finalize" in primary_backtrace
+
+    if worker_success and job_success:
+        observations.append(
+            "Payload EventLoop reported that the worker finished successfully and the batch job status was successful before process exit."
+        )
+    if output_postprocessing:
+        last_line = activity.get("last_nonempty_line")
+        suffix = ""
+        if isinstance(last_line, dict) and last_line.get("text"):
+            suffix = f"; the last payload line was: {last_line['text']}"
+        observations.append(
+            "Payload output continued into post-processing/output-file handling after EventLoop completion" + suffix + "."
+        )
+    if worker_success and clean_python_exit and xrootd_finalize:
+        observations.append(
+            "Combined payload and core evidence places the captured hang after successful event processing, during process shutdown/XRootD finalization rather than inside the EventLoop."
+        )
+    return observations
+
+
+
+
+def derive_process_identity(evidence: CoreEvidence) -> dict[str, Any]:
+    """Identify the process captured by the core without trusting gdb symbols alone.
+
+    The ``Core was generated by`` command line is core metadata and therefore
+    remains useful even when gdb warns that a supplied executable may not match.
+    Stack-shape signals are used as corroboration, not as the sole identity source.
+    """
+    command = evidence.generated_by or ""
+    primary = evidence.primary_thread.get("backtrace", "")
+    all_stacks = "\n".join(group.backtrace for group in evidence.thread_groups)
+    stack_text = primary + "\n" + all_stacks
+
+    signals = {
+        "generated_by": command or None,
+        "command_mentions_prmon": bool(re.search(r"(?:^|[/\s])prmon(?:\s|$)", command, re.I)),
+        "command_looks_like_payload": bool(re.search(
+            r"EWRun\.py|eventloop|/srv/workDir/usr/|/InstallArea/.*/bin/.*Run\.py", command, re.I
+        )),
+        "python_runtime_stack": "Py_Exit" in stack_text or "Py_RunMain" in stack_text,
+        "root_runtime_stack": "TROOT::" in stack_text or "TNetXNGFile::" in stack_text,
+        "xrootd_runtime_stack": "XrdCl::" in stack_text or "XrdSys::" in stack_text,
+        "stack_mentions_prmon": bool(re.search(r"\bprmon\b", stack_text, re.I)),
+    }
+
+    if signals["command_mentions_prmon"]:
+        return {
+            "kind": "prmon",
+            "confidence": "high",
+            "signals": signals,
+            "reason": "The core-recorded command line identifies prmon.",
+        }
+    if signals["command_looks_like_payload"]:
+        corroborated = signals["python_runtime_stack"] and (
+            signals["root_runtime_stack"] or signals["xrootd_runtime_stack"]
+        )
+        return {
+            "kind": "payload",
+            "confidence": "high" if corroborated else "medium",
+            "signals": signals,
+            "reason": (
+                "The core-recorded command line identifies the payload and the captured runtime stack is consistent with it."
+                if corroborated else
+                "The core-recorded command line identifies the payload, but stack corroboration is limited."
+            ),
+        }
+    if signals["stack_mentions_prmon"]:
+        return {
+            "kind": "prmon",
+            "confidence": "medium",
+            "signals": signals,
+            "reason": "The captured stack mentions prmon, but the core-recorded command line is inconclusive.",
+        }
+    return {
+        "kind": "unknown",
+        "confidence": "low",
+        "signals": signals,
+        "reason": "The available core metadata does not identify the captured process reliably.",
+    }
+
+
+def derive_symbol_evidence_quality(evidence: CoreEvidence) -> dict[str, Any]:
+    """Summarise whether symbol/build identity is verified strongly enough for diagnosis."""
+    checked = evidence.build_ids.get("checked", []) if isinstance(evidence.build_ids, dict) else []
+    mismatch_count = int(evidence.build_ids.get("mismatch_count", 0) or 0) if isinstance(evidence.build_ids, dict) else 0
+    module_count = int(evidence.build_ids.get("module_count", 0) or 0) if isinstance(evidence.build_ids, dict) else 0
+    match_warning = any("core may not match the executable" in warning.lower() for warning in evidence.warnings)
+    verified = len(checked) > 0 and mismatch_count == 0 and not match_warning
+    if mismatch_count:
+        level = "low"
+    elif match_warning and not checked:
+        level = "degraded"
+    elif verified:
+        level = "verified"
+    else:
+        level = "partial"
+    return {
+        "level": level,
+        "gdb_executable_match_warning": match_warning,
+        "key_build_ids_checked": len(checked),
+        "build_id_mismatch_count": mismatch_count,
+        "eu_unstrip_module_count": module_count,
+        "verified": verified,
+    }
+
+def derive_structured_diagnosis(evidence: CoreEvidence) -> dict[str, Any]:
+    """Build a conservative machine-readable diagnosis from deterministic evidence.
+
+    Classification describes the captured phase/component, not an initiating
+    root cause. Evidence-quality limitations can lower confidence without
+    discarding a strongly supported process-phase classification.
+    """
+    primary = evidence.primary_thread.get("backtrace", "")
+    all_stacks = "\n".join(group.backtrace for group in evidence.thread_groups)
+    activity = evidence.job_logs.get("payload_activity", {}) if isinstance(evidence.job_logs, dict) else {}
+    tail = activity.get("tail", []) if isinstance(activity, dict) else []
+    tail_text = "\n".join(str(item.get("text", "")) for item in tail if isinstance(item, dict))
+    process_identity = evidence.process_identity or derive_process_identity(evidence)
+    symbol_quality = derive_symbol_evidence_quality(evidence)
+
+    signals: dict[str, Any] = {
+        "clean_python_exit": "Py_Exit (sts=0)" in primary,
+        "xrootd_finalization": "XrdCl::DefaultEnv::Finalize" in primary,
+        "xrootd_poller_stop_wait": (
+            "XrdSys::IOEvents::Poller::SendCmd" in primary
+            and "XrdSys::IOEvents::Poller::Stop" in primary
+        ),
+        "root_close_files": "TROOT::CloseFiles" in primary,
+        "xrootd_remote_file_close": (
+            "TNetXNGFile::Close" in primary
+            and "XrdCl::File::Close" in primary
+            and "XrdCl::FileStateHandler::Close" in primary
+        ),
+        "xrootd_close_stream_mutex_wait": (
+            "XrdCl::StreamMutex::Lock" in primary
+            and "XrdCl::Stream::Send" in primary
+        ),
+        "xrootd_shutdown_events": "XrdCl::PollerBuiltIn::ShutdownEvents" in all_stacks,
+        "xrootd_socket_fault": (
+            "XrdCl::AsyncSocketHandler::OnFault" in all_stacks
+            or "XrdCl::Stream::OnError" in all_stacks
+        ),
+        "xrootd_read_timeout_force_disconnect": (
+            "XrdCl::Stream::OnReadTimeout" in all_stacks
+            and "ForceDisconnect" in all_stacks
+        ),
+        "xrootd_stream_mutex_wait": (
+            "XrdCl::StreamMutex::Lock" in all_stacks
+            and "XrdCl::Stream::Tick" in all_stacks
+        ),
+        "eventloop_worker_success": "worker finished successfully" in tail_text,
+        "batch_status_success": bool(re.search(
+            r"current job status:\s*\d+\s+success,\s*0\s+failure", tail_text, re.I
+        )),
+        "output_postprocessing": bool(re.search(
+            r"Moving the analysis root file|Moving .*hist-output|renaming .*output\.root", tail_text, re.I
+        )),
+        "captured_process": process_identity.get("kind", "unknown"),
+    }
+    silence = activity.get("last_write_before_core_s") if isinstance(activity, dict) else None
+    if isinstance(silence, (int, float)):
+        signals["payload_silence_before_core_s"] = round(float(silence), 3)
+
+    if process_identity.get("kind") == "prmon":
+        return {
+            "available": True,
+            "classification": "monitor-process-core",
+            "phase": "monitoring-process",
+            "component": "prmon",
+            "confidence": process_identity.get("confidence", "medium"),
+            "root_cause_established": False,
+            "payload_diagnosis_applicable": False,
+            "summary": "The core metadata identifies the captured process as prmon rather than the payload; payload-loop diagnosis is not applicable to this core.",
+            "process_identity": process_identity,
+            "symbol_evidence_quality": symbol_quality,
+            "signals": signals,
+            "supporting_evidence": [process_identity.get("reason", "The captured process is prmon.")],
+            "limitations": [
+                "Payload logs in the job directory describe the payload and must not be attributed to the prmon core."
+            ],
+        }
+
+    if (process_identity.get("kind") == "unknown"
+            and symbol_quality.get("level") in {"degraded", "low"}):
+        return {
+            "available": False,
+            "classification": "unclassified",
+            "confidence": "low",
+            "root_cause_established": False,
+            "process_identity": process_identity,
+            "symbol_evidence_quality": symbol_quality,
+            "signals": signals,
+            "reason": "Process identity is unknown and symbol/build identity is degraded; refusing to classify the stack signature.",
+        }
+
+    completed_payload = (
+        signals["eventloop_worker_success"]
+        and signals["batch_status_success"]
+        and signals["output_postprocessing"]
+    )
+    poller_shutdown_signature = (
+        evidence.mode == "hang"
+        and signals["clean_python_exit"]
+        and signals["xrootd_finalization"]
+        and signals["xrootd_poller_stop_wait"]
+    )
+    remote_close_signature = (
+        evidence.mode == "hang"
+        and signals["clean_python_exit"]
+        and signals["root_close_files"]
+        and signals["xrootd_remote_file_close"]
+        and signals["xrootd_close_stream_mutex_wait"]
+    )
+
+    if remote_close_signature:
+        classification = (
+            "post-event-processing-remote-file-close-hang"
+            if completed_payload else "remote-file-close-hang"
+        )
+        family = "post-event-processing-xrootd-shutdown-hang" if completed_payload else "xrootd-shutdown-hang"
+        subtype = "remote-file-close"
+        phase = "process-shutdown"
+        component = "ROOT/XRootD"
+        confidence = "high" if completed_payload else "medium"
+        summary = (
+            "Event processing completed successfully and the process later hung while ROOT/XRootD was closing a remote file during process shutdown."
+            if completed_payload else
+            "The process was captured in a clean Python exit path while ROOT/XRootD was closing a remote file."
+        )
+        supporting = []
+        if completed_payload:
+            supporting.extend([
+                "Payload reports that the EventLoop worker finished successfully.",
+                "Payload reports a successful batch status with zero failures.",
+                "Payload reached output-file post-processing before becoming silent.",
+            ])
+        supporting.append(
+            "Primary thread is in Py_Exit(sts=0) -> TROOT::CloseFiles -> TNetXNGFile::Close -> XrdCl::File::Close -> StreamMutex::Lock."
+        )
+        if signals["xrootd_shutdown_events"]:
+            supporting.append("A concurrent XRootD poller thread is in ShutdownEvents during socket close/error handling.")
+        if signals["xrootd_stream_mutex_wait"]:
+            supporting.append("A concurrent XRootD task thread waits in StreamMutex::Lock while running Stream::Tick.")
+    elif poller_shutdown_signature:
+        classification = "post-event-processing-shutdown-hang" if completed_payload else "shutdown-finalization-hang"
+        family = "post-event-processing-xrootd-shutdown-hang" if completed_payload else "xrootd-shutdown-hang"
+        subtype = "poller-finalization"
+        phase = "process-shutdown"
+        component = "XRootD/XrdCl"
+        confidence = "high" if completed_payload else "medium"
+        summary = (
+            "Event processing completed successfully and the process later hung during XRootD/XrdCl shutdown finalization."
+            if completed_payload else
+            "The process was captured in a clean Python exit path while blocked during XRootD/XrdCl shutdown finalization."
+        )
+        supporting = []
+        if signals["eventloop_worker_success"]:
+            supporting.append("Payload reports that the EventLoop worker finished successfully.")
+        if signals["batch_status_success"]:
+            supporting.append("Payload reports a successful batch status with zero failures.")
+        if signals["output_postprocessing"]:
+            supporting.append("Payload reached output-file post-processing before becoming silent.")
+        supporting.append("Primary thread is in Py_Exit(sts=0) -> XrdCl::DefaultEnv::Finalize -> Poller::Stop/SendCmd.")
+        if signals["xrootd_stream_mutex_wait"]:
+            supporting.append("A concurrent XRootD thread waits in StreamMutex::Lock while running Stream::Tick.")
+        if signals["xrootd_read_timeout_force_disconnect"]:
+            supporting.append("A concurrent XRootD thread handles OnReadTimeout with forced disconnect activity.")
+    else:
+        return {
+            "available": False,
+            "classification": "unclassified",
+            "confidence": "low",
+            "root_cause_established": False,
+            "process_identity": process_identity,
+            "symbol_evidence_quality": symbol_quality,
+            "signals": signals,
+            "reason": "No supported deterministic diagnosis rule matched the captured state.",
+        }
+
+    limitations = ["A single core snapshot does not prove the exact lock cycle."]
+    if signals["xrootd_read_timeout_force_disconnect"]:
+        limitations.append(
+            "The concurrent XRootD read timeout/forced-disconnect path is observed, but causality is not established."
+        )
+    if signals["xrootd_socket_fault"]:
+        limitations.append(
+            "Concurrent XRootD socket fault/error handling is observed, but causality is not established."
+        )
+    if symbol_quality["gdb_executable_match_warning"]:
+        limitations.append(
+            "GDB warns that the core may not match the supplied executable; key Build IDs could not verify the executable/system-library identity."
+        )
+        if confidence == "high":
+            confidence = "medium"
+    if evidence.targeted_threads and all(
+        not item.get("frame_details_available", True) for item in evidence.targeted_threads
+    ):
+        limitations.append("Selected XRootD frames lack usable argument/local DWARF in this optimized build.")
+
+    return {
+        "available": True,
+        "classification": classification,
+        "family": family,
+        "subtype": subtype,
+        "phase": phase,
+        "component": component,
+        "confidence": confidence,
+        "root_cause_established": False,
+        "summary": summary,
+        "process_identity": process_identity,
+        "symbol_evidence_quality": symbol_quality,
+        "signals": signals,
+        "supporting_evidence": supporting,
+        "limitations": limitations,
+    }
 
 def split_thread_stacks(text: str) -> list[tuple[str, str, str]]:
     """Split ``thread apply all bt`` output into per-thread backtraces.
@@ -833,12 +1834,14 @@ def group_thread_stacks(text: str, max_groups: int, redact_enabled: bool) -> lis
         group = buckets.get(signature)
         if group is None:
             trimmed, was_cut = truncate(redact(backtrace, redact_enabled), SECTION_LIMITS["thread_group"])
+            state = _classify_thread_stack(backtrace)
             buckets[signature] = ThreadGroup(
                 count=1,
                 thread_ids=[thread_id],
                 names=[thread_name] if thread_name else [],
                 backtrace=trimmed + ("" if not was_cut else ""),
-                idle=_is_idle_stack(backtrace),
+                idle=(state == "idle"),
+                state=state,
             )
             continue
         group.count += 1
@@ -847,33 +1850,106 @@ def group_thread_stacks(text: str, max_groups: int, redact_enabled: bool) -> lis
         if thread_name and thread_name not in group.names:
             group.names.append(thread_name)
 
-    groups = sorted(buckets.values(), key=lambda grp: (grp.idle, -grp.count))
+    state_rank = {"blocked": 0, "active": 1, "idle": 2}
+    groups = sorted(buckets.values(), key=lambda grp: (state_rank.get(grp.state, 1), -grp.count))
     return groups[:max_groups]
 
 
+
+def derive_deterministic_observations(primary_backtrace: str,
+                                      thread_groups: list[ThreadGroup]) -> list[str]:
+    """Derive conservative, pattern-based observations without an LLM.
+
+    These are intentionally factual stack-state statements, not root-cause
+    claims. They make ``--no-llm`` useful while preserving the distinction
+    between evidence and synthesis.
+    """
+    observations: list[str] = []
+    all_stacks = "\n".join(group.backtrace for group in thread_groups)
+
+    clean_python_exit = "Py_Exit (sts=0)" in primary_backtrace
+    xrootd_finalize = (
+        "XrdCl::DefaultEnv::Finalize" in primary_backtrace
+        and "XrdCl::PostMaster::Stop" in primary_backtrace
+        and "XrdSys::IOEvents::Poller::Stop" in primary_backtrace
+    )
+    if clean_python_exit and xrootd_finalize:
+        observations.append(
+            "Process is already in Py_Exit(sts=0) and is blocked while XRootD/XrdCl finalization stops the poller."
+        )
+    elif xrootd_finalize:
+        observations.append(
+            "Primary thread is blocked while XRootD/XrdCl finalization stops the poller."
+        )
+
+    remote_file_close = (
+        "TROOT::CloseFiles" in primary_backtrace
+        and "TNetXNGFile::Close" in primary_backtrace
+        and "XrdCl::File::Close" in primary_backtrace
+        and "XrdCl::StreamMutex::Lock" in primary_backtrace
+    )
+    if clean_python_exit and remote_file_close:
+        observations.append(
+            "Process is already in Py_Exit(sts=0) and is blocked while ROOT/XRootD closes a remote file."
+        )
+
+    if "XrdCl::Stream::OnReadTimeout" in all_stacks and "ForceDisconnect" in all_stacks:
+        observations.append(
+            "A concurrent XRootD thread is handling a read timeout and forced disconnect during the captured state."
+        )
+    if "XrdCl::StreamMutex::Lock" in all_stacks and "XrdCl::Stream::Tick" in all_stacks:
+        observations.append(
+            "Another XRootD thread is waiting in StreamMutex::Lock while processing Stream::Tick."
+        )
+    return observations
+
+
+def _backtrace_has_unknown_frames(text: str) -> bool:
+    """Return whether actual backtrace frames, rather than args/locals, lack symbols."""
+    return bool(re.search(r"^#\d+\s+.*(?:\bin \?\?|\s\?\?\s*$)", text, re.M))
+
+
 def summarise_shared_libraries(text: str) -> dict[str, Any]:
-    """Summarise ``info sharedlibrary`` output.
+    """Summarise ``info sharedlibrary`` without conflating symbol states.
 
-    Only the libraries *without* symbols are kept verbatim, since a full list of
-    300 loaded ATLAS libraries adds tokens without adding signal.
-
-    Args:
-        text: Output of ``info sharedlibrary``.
-
-    Returns:
-        A dictionary with the total count and the unsymbolised subset.
+    GDB reports three materially different states: ``Yes`` means symbols were
+    read, ``Yes (*)`` means symbols were read but full/separate debugging
+    information is absent, and ``No`` means symbols were not read. Only ``No``
+    belongs in ``without_symbols``. A plain ``Yes`` is not a guarantee that
+    every optimized function in that DSO has recoverable arguments or locals.
     """
     total = 0
-    missing: list[str] = []
+    without_symbols: list[str] = []
+    without_full_debug: list[str] = []
+    with_symbols_count = 0
+    pattern = re.compile(
+        r"^\s*0x[0-9a-fA-F]+\s+0x[0-9a-fA-F]+\s+(Yes(?:\s+\(\*\))?|No)\s+(.+?)\s*$"
+    )
     for line in text.splitlines():
-        if "/" not in line:
+        match = pattern.match(line)
+        if not match:
+            continue
+        status, path = match.groups()
+        if not path.startswith("/"):
             continue
         total += 1
-        if "No" in line.split()[:3] or "(*)" in line:
-            path = line.split()[-1]
-            if path.startswith("/") and len(missing) < 40:
-                missing.append(path)
-    return {"total_loaded": total, "without_symbols": missing, "without_symbols_count": len(missing)}
+        if status == "No":
+            if len(without_symbols) < 40:
+                without_symbols.append(path)
+        elif "(*)" in status:
+            with_symbols_count += 1
+            if len(without_full_debug) < 40:
+                without_full_debug.append(path)
+        else:
+            with_symbols_count += 1
+    return {
+        "total_loaded": total,
+        "with_symbols_count": with_symbols_count,
+        "without_symbols": without_symbols,
+        "without_symbols_count": len(without_symbols),
+        "without_full_debug_info": without_full_debug,
+        "without_full_debug_info_count": len(without_full_debug),
+    }
 
 
 def detect_mode(requested: str, signal: str | None, generated_by: str | None) -> tuple[str, str]:
@@ -921,7 +1997,13 @@ def _build_phase_plan(args: argparse.Namespace) -> list[tuple[str, list[tuple[st
         primary.append(("locals", "info locals"))
     primary.append(("registers", "info registers"))
     return [
-        ("metadata", [("program", "info program"), ("threads", "info threads")]),
+        ("metadata", [
+            ("program", "info program"),
+            ("threads", "info threads"),
+            ("files", "info files"),
+            ("debug_file_directory", "show debug-file-directory"),
+            ("auto_load_python_scripts", "info auto-load python-scripts"),
+        ]),
         ("primary_thread", primary),
         ("all_threads", [("all_threads", f"thread apply all bt {args.max_frames}")]),
         ("python", [("py_bt", "py-bt"), ("py_list", "py-list")]),
@@ -952,7 +2034,7 @@ def _trim_primary_sections(sections: dict[str, str], redact_enabled: bool) -> tu
     return trimmed, truncated
 
 
-def collect_evidence(
+def _collect_evidence_local(
     args: argparse.Namespace, progress: bool = True, detail: bool = False,
 ) -> tuple[CoreEvidence, str]:
     """Drive gdb and assemble the structured evidence bundle.
@@ -979,6 +2061,7 @@ def collect_evidence(
 
     gdb_path = find_gdb(args.gdb)
     evidence = CoreEvidence()
+    evidence.environment = collect_runtime_environment()
     stat = core_path.stat()
     size_mib = stat.st_size / (1024 ** 2)
     evidence.core_file = {
@@ -1016,7 +2099,26 @@ def collect_evidence(
     if progress:
         print(f"[*] Executable: {exe_path or 'UNRESOLVED'} (via {evidence.executable['source']})", file=sys.stderr)
 
+    evidence.build_ids, unstrip_raw = collect_build_id_evidence(core_path, exe_path)
+    if not evidence.build_ids.get("available"):
+        evidence.warnings.append(
+            "Build-ID comparison was not available; executable/system-library identity was not verified."
+        )
+    elif not evidence.build_ids.get("checked"):
+        evidence.warnings.append(
+            f"Build-ID coverage is insufficient: eu-unstrip enumerated {evidence.build_ids.get('module_count', 0)} module(s), "
+            "but no executable or critical system-library Build IDs could be verified."
+        )
+    for item in evidence.build_ids.get("checked", []):
+        if item.get("match") is False:
+            evidence.warnings.append(
+                f"Build-ID mismatch for {item.get('name')}: core {item.get('core_build_id')} vs "
+                f"analysis file {item.get('file_build_id')}. Stack unwinding/symbols may be misleading."
+            )
+
     raw_chunks: list[str] = [f"$ gdb -c {core_path.name} -ex 'info program'\n{probe.stdout}\n{probe.stderr}"]
+    if unstrip_raw:
+        raw_chunks.append(f"\n{'=' * 70}\n# eu-unstrip -n --core {core_path.name}\n{'=' * 70}\n{unstrip_raw}")
     sections: dict[str, str] = {}
     errors: dict[str, str] = {}
     for name, commands in _build_phase_plan(args):
@@ -1044,6 +2146,45 @@ def collect_evidence(
                 f"gdb phase '{name}' timed out after {args.gdb_timeout}s; its evidence is missing."
             )
 
+    # Select interesting thread/frame pairs only after the all-thread phase has
+    # established the shape of the hang.  All focused inspections run in one
+    # additional gdb process so large cores are reloaded only once more.
+    evidence.thread_groups = group_thread_stacks(
+        sections.get("all_threads", ""), args.max_thread_groups, not args.no_redact
+    )
+    targets = select_targeted_threads(
+        evidence.thread_groups, getattr(args, "max_targeted_threads", DEFAULT_MAX_TARGETED_THREADS)
+    )
+    if targets:
+        commands = _build_targeted_phase(targets, args.locals)
+        result = run_gdb_phase(
+            gdb_path, core_path, exe_path, "targeted_threads", commands, args.gdb_timeout,
+            progress=progress, detail=detail, heartbeat_interval=heartbeat_interval,
+        )
+        sections.update(result.sections)
+        errors["targeted_threads"] = result.stderr
+        banner = "=" * 70
+        rendered = "; ".join(cmd for _, cmd in commands)
+        raw_chunks.append(
+            f"\n{banner}\n# phase: targeted_threads ({rendered})\n{banner}\n{result.stdout}\n{result.stderr}"
+        )
+        evidence.phases.append({
+            "name": result.name,
+            "commands": result.commands,
+            "returncode": result.returncode,
+            "timed_out": result.timed_out,
+            "duration_s": result.duration_s,
+            "stderr_excerpt": redact(result.stderr[:500], not args.no_redact),
+        })
+        if result.timed_out:
+            evidence.warnings.append(
+                f"gdb phase 'targeted_threads' timed out after {args.gdb_timeout}s; focused frame evidence is missing."
+            )
+        else:
+            evidence.targeted_threads = summarise_targeted_threads(
+                targets, result.sections, not args.no_redact
+            )
+
     combined = "\n".join(raw_chunks)
     evidence.signal = parse_signal(combined)
     evidence.generated_by = redact(parse_generated_by(combined) or "", not args.no_redact) or None
@@ -1055,14 +2196,301 @@ def collect_evidence(
     primary, truncated = _trim_primary_sections(sections, not args.no_redact)
     evidence.primary_thread = primary
     evidence.truncated_sections.extend(truncated)
-    evidence.thread_groups = group_thread_stacks(
-        sections.get("all_threads", ""), args.max_thread_groups, not args.no_redact
+    evidence.observations = derive_deterministic_observations(
+        primary.get("backtrace", ""), evidence.thread_groups
     )
+    if _backtrace_has_unknown_frames(
+        sections.get("backtrace", "") + "\n" + sections.get("all_threads", "")
+    ):
+        evidence.warnings.append("Some backtrace frames have no symbol information.")
     evidence.python = _summarise_python(
         sections.get("py_bt", ""), sections.get("py_list", ""), errors.get("python", ""), not args.no_redact
     )
     evidence.shared_libraries = summarise_shared_libraries(sections.get("libraries", ""))
+    missing_library_symbols = evidence.shared_libraries.get("without_symbols_count", 0)
+    if missing_library_symbols:
+        evidence.warnings.append(
+            f"GDB could not read symbols for {missing_library_symbols} loaded shared librar"
+            f"{'y' if missing_library_symbols == 1 else 'ies'}."
+        )
+    files_excerpt, files_cut = truncate(
+        redact(sections.get("files", ""), not args.no_redact), 4_000
+    )
+    evidence.gdb_metadata = {
+        "debug_file_directory": redact(sections.get("debug_file_directory", ""), not args.no_redact),
+        "auto_load_python_scripts": redact(sections.get("auto_load_python_scripts", ""), not args.no_redact),
+        "info_files_excerpt": files_excerpt,
+        "info_files_truncated": files_cut,
+        "startup_warnings": list(dict.fromkeys(
+            redact(line.strip(), not args.no_redact)
+            for line in combined.splitlines()
+            if "warning:" in line.lower()
+        ))[:20],
+    }
     return evidence, combined
+
+
+def core_evidence_from_dict(payload: dict[str, Any]) -> CoreEvidence:
+    """Reconstruct :class:`CoreEvidence` from a JSON-serialised dictionary.
+
+    Older evidence bundles only carried the boolean ``idle`` field. Preserve
+    their meaning when loading them after the additive ``state`` field was
+    introduced in 0.2.1.
+    """
+    data = dict(payload)
+    groups: list[ThreadGroup] = []
+    for raw_group in data.get("thread_groups", []):
+        group = dict(raw_group)
+        if "state" not in group:
+            group["state"] = "idle" if group.get("idle") else "active"
+        groups.append(ThreadGroup(**group))
+    data["thread_groups"] = groups
+    allowed = set(CoreEvidence.__dataclass_fields__)
+    return CoreEvidence(**{key: value for key, value in data.items() if key in allowed})
+
+
+def _container_path(host_path: Path, job_dir: Path) -> str:
+    """Translate a path under the job directory to its standard ``/srv`` mount."""
+    try:
+        rel = host_path.resolve().relative_to(job_dir.resolve())
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Path {host_path} is outside --job-dir {job_dir}. The ATLAS container backend currently "
+            "requires the core and release setup to live under the job directory mounted at /srv."
+        ) from exc
+    return "/srv" if str(rel) == "." else f"/srv/{rel.as_posix()}"
+
+
+def _container_worker_args(args: argparse.Namespace, core_in_container: str,
+                           worker_in_container: str, json_in_container: str,
+                           raw_in_container: str, job_dir: Path) -> list[str]:
+    """Build the evidence-only analyzer command executed inside the container."""
+    argv = [
+        "python3", worker_in_container, core_in_container,
+        "--execution", "local",
+        "--mode", args.mode,
+        "--max-frames", str(args.max_frames),
+        "--max-thread-groups", str(args.max_thread_groups),
+        "--max-targeted-threads", str(getattr(args, "max_targeted_threads", DEFAULT_MAX_TARGETED_THREADS)),
+        "--max-evidence-chars", str(args.max_evidence_chars),
+        "--gdb-timeout", str(args.gdb_timeout),
+        "--heartbeat-interval", str(getattr(args, "heartbeat_interval", DEFAULT_HEARTBEAT_INTERVAL)),
+        "--large-core-warning-mib", "0",
+        "--no-llm",
+        "--json", json_in_container,
+        "--raw-gdb", raw_in_container,
+        "--quiet",
+    ]
+    if not args.locals:
+        argv.append("--no-locals")
+    if args.no_redact:
+        argv.append("--no-redact")
+    if args.exe:
+        exe = Path(args.exe).expanduser()
+        if exe.is_absolute() and exe.exists():
+            try:
+                exe_arg = _container_path(exe, job_dir)
+            except RuntimeError:
+                exe_arg = str(exe)
+        else:
+            exe_arg = args.exe
+        argv += ["--exe", exe_arg]
+    if args.gdb:
+        argv += ["--gdb", args.gdb]
+    return argv
+
+
+def _collect_evidence_atlas_container(
+    args: argparse.Namespace, progress: bool = True, detail: bool = False,
+) -> tuple[CoreEvidence, str]:
+    """Run the deterministic collector once inside an ATLAS AlmaLinux container.
+
+    The original PanDA ``container_script.sh`` is intentionally not executed.
+    Instead, ``atlasLocalSetup.sh`` sets up the requested container and release,
+    then runs an analyzer-owned worker that invokes this script in evidence-only
+    local mode. LLM synthesis remains in the host process.
+    """
+    core_path = Path(args.core_file).expanduser().resolve()
+    if not core_path.is_file():
+        raise FileNotFoundError(f"Core file not found: {core_path}")
+    job_dir = Path(getattr(args, "job_dir", None) or core_path.parent).expanduser().resolve()
+    if not job_dir.is_dir():
+        raise FileNotFoundError(f"Job directory not found: {job_dir}")
+    core_in_container = _container_path(core_path, job_dir)
+
+    release_value = getattr(args, "release_setup", None)
+    release_setup = Path(release_value).expanduser().resolve() if release_value else job_dir / "my_release_setup.sh"
+    if not release_setup.is_file():
+        raise FileNotFoundError(
+            f"Release setup not found: {release_setup}. Pass --release-setup or place my_release_setup.sh in --job-dir."
+        )
+    release_in_container = _container_path(release_setup, job_dir)
+
+    alrb = Path(getattr(args, "atlas_local_root_base", DEFAULT_ATLAS_LOCAL_ROOT_BASE)).expanduser().resolve()
+    atlas_setup = alrb / "user" / "atlasLocalSetup.sh"
+    if not atlas_setup.is_file():
+        raise FileNotFoundError(f"ATLAS Local Root Base setup not found: {atlas_setup}")
+
+    created: list[Path] = []
+    try:
+        worker_fd, worker_name = tempfile.mkstemp(prefix=".core_dump_analyzer_worker_", suffix=".py", dir=job_dir)
+        os.close(worker_fd)
+        worker_path = Path(worker_name)
+        shutil.copy2(Path(__file__).resolve(), worker_path)
+        created.append(worker_path)
+
+        json_fd, json_name = tempfile.mkstemp(prefix=".core_dump_analyzer_evidence_", suffix=".json", dir=job_dir)
+        os.close(json_fd)
+        json_path = Path(json_name)
+        created.append(json_path)
+
+        raw_fd, raw_name = tempfile.mkstemp(prefix=".core_dump_analyzer_gdb_", suffix=".txt", dir=job_dir)
+        os.close(raw_fd)
+        raw_path = Path(raw_name)
+        created.append(raw_path)
+
+        runner_fd, runner_name = tempfile.mkstemp(prefix=".core_dump_analyzer_runner_", suffix=".sh", dir=job_dir)
+        os.close(runner_fd)
+        runner_path = Path(runner_name)
+        created.append(runner_path)
+
+        worker_in_container = _container_path(worker_path, job_dir)
+        json_in_container = _container_path(json_path, job_dir)
+        raw_in_container = _container_path(raw_path, job_dir)
+        runner_in_container = _container_path(runner_path, job_dir)
+        worker_argv = _container_worker_args(
+            args, core_in_container, worker_in_container, json_in_container, raw_in_container, job_dir
+        )
+        runner_path.write_text(
+            "#!/bin/bash\nset -euo pipefail\nexec " + shlex.join(worker_argv) + "\n",
+            encoding="utf-8",
+        )
+        runner_path.chmod(0o700)
+
+        platform = getattr(args, "atlas_platform", DEFAULT_ATLAS_PLATFORM)
+        extra_args = getattr(args, "container_extra_args", "-c -i")
+        source_cmd = (
+            f"export ATLAS_LOCAL_ROOT_BASE={shlex.quote(str(alrb))}; "
+            f"source {shlex.quote(str(atlas_setup))} "
+            f"-c {shlex.quote(platform)} "
+            f"-s {shlex.quote(release_in_container)} "
+            f"-r {shlex.quote(runner_in_container)} "
+            f"-e {shlex.quote(extra_args)}"
+        )
+        if progress:
+            print(f"[*] ATLAS container analysis starting ({platform}, job dir {job_dir})...", file=sys.stderr)
+        started = time.monotonic()
+        stop_event = threading.Event()
+        heartbeat_thread: threading.Thread | None = None
+        if progress and detail:
+            heartbeat_thread = threading.Thread(
+                target=_report_heartbeat,
+                args=("atlas-container", started, stop_event,
+                      getattr(args, "heartbeat_interval", DEFAULT_HEARTBEAT_INTERVAL)),
+                daemon=True,
+            )
+            heartbeat_thread.start()
+        try:
+            proc = subprocess.run(
+                ["bash", "-lc", source_cmd], cwd=job_dir, capture_output=True, text=True, check=False,
+                timeout=getattr(args, "container_timeout", DEFAULT_CONTAINER_TIMEOUT),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"ATLAS container analysis timed out after "
+                f"{getattr(args, 'container_timeout', DEFAULT_CONTAINER_TIMEOUT)}s"
+            ) from exc
+        finally:
+            stop_event.set()
+            if heartbeat_thread is not None:
+                heartbeat_thread.join(timeout=1.0)
+        if progress:
+            print(f"[*] ATLAS container analysis completed in {time.monotonic() - started:.1f}s", file=sys.stderr)
+
+        if proc.returncode != 0 or not json_path.stat().st_size:
+            diagnostics = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+            diagnostics = diagnostics[-6000:]
+            raise RuntimeError(
+                f"ATLAS container evidence collector failed with exit code {proc.returncode}.\n{diagnostics}"
+            )
+
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        evidence = core_evidence_from_dict(payload["evidence"])
+        evidence.environment["execution_backend"] = "atlas-container"
+        evidence.environment["atlas_platform"] = platform
+        evidence.environment["release_setup"] = str(release_setup)
+        evidence.environment["job_dir"] = str(job_dir)
+        evidence.core_file["container_path"] = core_in_container
+        evidence.core_file["path"] = str(core_path)
+        raw = raw_path.read_text(encoding="utf-8", errors="replace") if raw_path.exists() else ""
+        return evidence, raw
+    finally:
+        if not getattr(args, "keep_container_artifacts", False):
+            for path in created:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+
+
+def collect_evidence(
+    args: argparse.Namespace, progress: bool = True, detail: bool = False,
+) -> tuple[CoreEvidence, str]:
+    """Collect core evidence, then optionally correlate bounded payload/job logs on the host."""
+    execution = getattr(args, "execution", "local")
+    if execution == "atlas-container":
+        evidence, raw = _collect_evidence_atlas_container(args, progress=progress, detail=detail)
+    else:
+        evidence, raw = _collect_evidence_local(args, progress=progress, detail=detail)
+
+    job_dir_value = getattr(args, "job_dir", None)
+    collect_logs = getattr(args, "collect_job_logs", True)
+    # The in-container worker is a local backend with no --job-dir, so it never
+    # recursively scans logs. Correlation happens once, on the host, after the
+    # matching-environment core evidence has been returned.
+    if collect_logs and job_dir_value:
+        job_dir = Path(job_dir_value).expanduser().resolve()
+        if job_dir.is_dir():
+            evidence.job_logs = collect_job_log_evidence(
+                job_dir,
+                explicit=getattr(args, "job_log", None),
+                max_files=getattr(args, "max_job_log_files", DEFAULT_MAX_JOB_LOG_FILES),
+                max_matches=getattr(args, "max_job_log_matches", DEFAULT_MAX_JOB_LOG_MATCHES),
+                tail_lines=getattr(args, "job_log_tail_lines", DEFAULT_JOB_LOG_TAIL_LINES),
+                redact_enabled=not args.no_redact,
+                core_mtime=Path(args.core_file).expanduser().resolve().stat().st_mtime
+                if Path(args.core_file).expanduser().resolve().is_file() else None,
+                failure_mode=evidence.mode,
+            )
+            activity = evidence.job_logs.get("payload_activity", {})
+            silence = activity.get("last_write_before_core_s")
+            if isinstance(silence, (int, float)) and silence >= 300:
+                observation = (
+                    f"{activity.get('latest_payload_file', 'Payload log')} was last modified "
+                    f"{activity.get('last_write_before_core_human', _format_duration(float(silence)))} before the core capture"
+                )
+                last_line = activity.get("last_nonempty_line")
+                if isinstance(last_line, dict) and last_line.get("text"):
+                    observation += f"; its last non-empty line was: {last_line['text']}"
+                latest_progress = activity.get("latest_progress")
+                if (isinstance(latest_progress, dict) and latest_progress.get("text")
+                        and (not isinstance(last_line, dict) or latest_progress.get("line") != last_line.get("line"))):
+                    observation += f"; latest retained progress: {latest_progress['text']}"
+                evidence.observations.append(observation + ".")
+            for item in derive_payload_log_observations(
+                evidence.job_logs, evidence.primary_thread.get("backtrace", "")
+            ):
+                if item not in evidence.observations:
+                    evidence.observations.append(item)
+            if progress and evidence.job_logs.get("available"):
+                print(
+                    f"[*] Payload/job-log correlation: {len(evidence.job_logs.get('files', []))} file(s), "
+                    f"{len(evidence.job_logs.get('matches', []))} relevant line(s)",
+                    file=sys.stderr,
+                )
+    evidence.process_identity = derive_process_identity(evidence)
+    evidence.diagnosis = derive_structured_diagnosis(evidence)
+    return evidence, raw
 
 
 def _summarise_python(text: str, source: str, stderr: str, redact_enabled: bool) -> dict[str, Any]:
@@ -1085,8 +2513,8 @@ def _summarise_python(text: str, source: str, stderr: str, redact_enabled: bool)
     if "Undefined command" in stderr or "Undefined command" in text:
         return {
             "available": False,
-            "reason": ("py-bt is not available: the libpython gdb helper is not loaded. Ensure the "
-                       "interpreter's python-gdb.py is on the auto-load path and debug symbols are present."),
+            "reason": ("py-bt is not available because the libpython/CPython GDB helper (python-gdb.py) is not loaded. "
+                       "This is separate from native Python symbol availability or full DWARF debug information."),
         }
     has_frames = bool(
         re.search(r"Traceback \(most recent call first\)", text)
@@ -1232,8 +2660,9 @@ def enforce_global_budget(evidence: CoreEvidence, limit: int, detail: bool = Fal
         detail: Whether to log which sections were trimmed to stderr.
 
     Returns:
-        The same evidence object, mutated to fit within ``limit`` wherever the
-        cascade was able to. See ``evidence.warnings`` for whether it fully
+        The supplied evidence object, mutated to fit within ``limit`` wherever the
+        cascade was able to. Callers should pass a disposable/deep-copied LLM input,
+        never the canonical evidence artifact. See ``evidence.warnings`` for whether it fully
         succeeded.
     """
     stages: list[tuple[str, Callable[[], bool]]] = [
@@ -1291,8 +2720,9 @@ lower your confidence accordingly. A confident wrong answer is worse than an hon
 - Distinguish clearly between application code (Athena algorithms, physics code, user Python) and \
 framework or system noise (TBB, GaudiHive, libc, pthread, the Python interpreter loop). The interesting \
 frame is almost always the deepest one belonging to application code.
-- Threads parked on pthread_cond_wait, futex or epoll are idle workers, not the problem. Do not report them \
-as findings.
+- A top frame in pthread_cond_wait, futex or epoll does not by itself make a thread irrelevant. Inspect deeper \
+frames: a thread blocked while stopping a subsystem, acquiring a lock, handling a timeout, or finalizing can be \
+central to a hang. Treat only genuinely parked worker-loop stacks as idle.
 """
 
 SYSTEM_PROMPT_CRASH = """
@@ -1540,6 +2970,24 @@ def render_report(evidence: CoreEvidence, analysis: dict[str, Any] | None) -> st
     lines.append(f"Signal       : {evidence.signal or 'none recorded'}")
     lines.append(f"Threads      : {evidence.thread_count if evidence.thread_count is not None else 'unknown'}")
     lines.append(f"Analysis mode: {evidence.mode} ({evidence.mode_source})")
+    if evidence.environment:
+        backend = evidence.environment.get("execution_backend", "local")
+        os_name = evidence.environment.get("os", "unknown")
+        lines.append(f"Environment  : {os_name} ({backend})")
+    if evidence.build_ids.get("available"):
+        checked = len(evidence.build_ids.get("checked", []))
+        mismatches = evidence.build_ids.get("mismatch_count", 0)
+        if checked:
+            lines.append(f"Build IDs    : {checked} key module(s) checked, {mismatches} mismatch(es)")
+        else:
+            lines.append(
+                f"Build IDs    : UNVERIFIED (eu-unstrip enumerated {evidence.build_ids.get('module_count', 0)} module(s); 0 key modules checked)"
+            )
+    if evidence.process_identity:
+        lines.append(
+            f"Core process : {evidence.process_identity.get('kind', 'unknown')} "
+            f"({evidence.process_identity.get('confidence', 'low')} confidence)"
+        )
     if evidence.generated_by:
         lines.append(f"Generated by : {evidence.generated_by}")
     if evidence.python.get("available"):
@@ -1550,12 +2998,97 @@ def render_report(evidence: CoreEvidence, analysis: dict[str, Any] | None) -> st
         lines += ["EVIDENCE QUALITY WARNINGS", "-" * 78, _bullets(evidence.warnings), ""]
 
     if analysis is None:
-        lines += ["(--no-llm: showing extracted evidence only)", "", "THREAD SUMMARY", "-" * 78]
+        lines += ["(--no-llm: showing extracted evidence only)", ""]
+        if evidence.diagnosis.get("available"):
+            diagnosis = evidence.diagnosis
+            lines += ["DETERMINISTIC DIAGNOSIS", "-" * 78]
+            lines.append(f"  Classification: {diagnosis.get('classification', 'unclassified')}")
+            if diagnosis.get("family"):
+                lines.append(f"  Family        : {diagnosis.get('family')}")
+            if diagnosis.get("subtype"):
+                lines.append(f"  Subtype       : {diagnosis.get('subtype')}")
+            lines.append(f"  Phase         : {diagnosis.get('phase', 'unknown')}")
+            lines.append(f"  Component     : {diagnosis.get('component', 'unknown')}")
+            lines.append(f"  Confidence    : {diagnosis.get('confidence', 'unknown')}")
+            lines.append(f"  Root cause    : {'established' if diagnosis.get('root_cause_established') else 'not established'}")
+            if diagnosis.get("summary"):
+                lines.append(f"  Summary       : {diagnosis.get('summary')}")
+            if diagnosis.get("limitations"):
+                lines.append("  Limitations:")
+                lines.extend(f"    - {item}" for item in diagnosis.get("limitations", []))
+            lines.append("")
+        if evidence.observations:
+            lines += ["DETERMINISTIC OBSERVATIONS", "-" * 78, _bullets(evidence.observations), ""]
+        lines += ["THREAD SUMMARY", "-" * 78]
         for group in evidence.thread_groups[:10]:
-            top = next((ln for ln in group.backtrace.splitlines() if ln.strip().startswith("#0")), "?")
-            state = "idle" if group.idle else "BUSY"
-            lines.append(f"  [{state}] {group.count:>4} thread(s): {top.strip()[:100]}")
+            state = "BUSY" if group.state == "active" else ("BLOCKED" if group.state == "blocked" else "idle")
+            tids = ",".join(group.thread_ids[:3])
+            context = _thread_context_frame(group.backtrace)
+            lines.append(f"  [{state}] {group.count:>4} thread(s) T{tids}: {context[:115]}")
         lines.append("")
+        if evidence.targeted_threads:
+            lines += ["TARGETED FRAME EVIDENCE", "-" * 78]
+            unavailable = 0
+            for target in evidence.targeted_threads:
+                lines.append(
+                    f"  T{target.get('thread_id')} frame {target.get('frame')} [{str(target.get('state', '')).upper()}]: "
+                    f"{str(target.get('context', '?'))[:105]}"
+                )
+                if target.get("frame_details_available", True):
+                    for label in ("args", "locals"):
+                        value = str(target.get(label, "")).strip()
+                        if value:
+                            compact = " | ".join(line.strip() for line in value.splitlines() if line.strip())
+                            lines.append(f"    {label}: {compact[:220]}")
+                else:
+                    unavailable += 1
+            if unavailable:
+                lines.append(
+                    f"  Note: arguments/locals were unavailable for {unavailable} selected frame(s); "
+                    "this can occur in optimized functions even when GDB reports symbols read for the library."
+                )
+            lines.append("")
+        if evidence.job_logs.get("available"):
+            profile = evidence.job_logs.get("profile", "general")
+            title = "PAYLOAD LOG CORRELATION" if profile == "payload-centric" else "JOB LOG CORRELATION"
+            lines += [title, "-" * 78]
+            counts = evidence.job_logs.get("category_counts", {})
+            lines.append(
+                "  Scanned: " + str(len(evidence.job_logs.get("files", []))) + " file(s); retained relevant lines: " +
+                str(len(evidence.job_logs.get("matches", []))) +
+                (f" ({', '.join(f'{k}={v}' for k, v in sorted(counts.items()))})" if counts else "")
+            )
+            if evidence.job_logs.get("pilotlog_default_excluded"):
+                lines.append("  Scope: payload stdout/stderr plus log-like files under workDir; pilotlog.txt excluded for hang mode.")
+            activity = evidence.job_logs.get("payload_activity", {})
+            if activity:
+                line = (
+                    f"  Payload activity: {activity.get('latest_payload_file', '?')} last modified "
+                    f"{activity.get('last_write_before_core_human', '?')} before core capture"
+                )
+                last_line = activity.get("last_nonempty_line")
+                if isinstance(last_line, dict) and last_line.get("text"):
+                    line += f"; last non-empty line {last_line.get('line', '?')}: {str(last_line.get('text'))[:120]}"
+                latest_progress = activity.get("latest_progress")
+                if (isinstance(latest_progress, dict) and latest_progress.get("text")
+                        and (not isinstance(last_line, dict) or latest_progress.get("line") != last_line.get("line"))):
+                    line += f"; latest retained progress: {str(latest_progress.get('text'))[:120]}"
+                lines.append(line)
+                tail = activity.get("tail")
+                if isinstance(tail, list) and tail:
+                    lines.append("  Payload tail (last non-empty lines):")
+                    for item in tail[-8:]:
+                        if isinstance(item, dict):
+                            lines.append(f"    {activity.get('latest_payload_file', '?')}:{item.get('line', '?')}: {str(item.get('text', ''))[:170]}")
+            for match in evidence.job_logs.get("matches", [])[:12]:
+                display_file = match.get("relative_file") or Path(str(match.get("file", "?"))).name
+                lines.append(
+                    f"  [{str(match.get('category', '?')).upper()}] {display_file}:"
+                    f"{match.get('line', '?')}: {str(match.get('text', ''))[:180]}"
+                )
+            if len(evidence.job_logs.get("matches", [])) > 12:
+                lines.append("  ... additional matched lines are retained in JSON.")
+            lines.append("")
         return "\n".join(lines)
 
     sections: list[tuple[str, Any]] = [
@@ -1613,6 +3146,40 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("core_file", help="Path to the core dump file, e.g. core.123456")
+    parser.add_argument(
+        "--execution", choices=["local", "atlas-container"], default="local",
+        help="Where to collect deterministic evidence. 'local' uses the current OS; "
+             "'atlas-container' recreates the ATLAS release/container environment.",
+    )
+    parser.add_argument("--job-dir", default=None,
+                        help="PanDA job directory mounted as /srv in atlas-container mode "
+                             "(default: directory containing the core).")
+    parser.add_argument("--release-setup", default=None,
+                        help="Release setup script for atlas-container mode "
+                             "(default: <job-dir>/my_release_setup.sh).")
+    parser.add_argument("--atlas-platform", default=DEFAULT_ATLAS_PLATFORM,
+                        help=f"ATLAS container platform (default: {DEFAULT_ATLAS_PLATFORM}).")
+    parser.add_argument("--atlas-local-root-base", default=DEFAULT_ATLAS_LOCAL_ROOT_BASE,
+                        help="ATLASLocalRootBase path on the host.")
+    parser.add_argument("--container-extra-args", default="-c -i",
+                        help="Raw Apptainer arguments passed through atlasLocalSetup.sh -e "
+                             "(default: '-c -i').")
+    parser.add_argument("--container-timeout", type=int, default=DEFAULT_CONTAINER_TIMEOUT,
+                        help=f"Whole container evidence-run timeout in seconds "
+                             f"(default: {DEFAULT_CONTAINER_TIMEOUT}).")
+    parser.add_argument("--keep-container-artifacts", action="store_true",
+                        help="Keep generated worker/runner/evidence files in --job-dir for debugging.")
+    parser.add_argument("--job-log", action="append", default=None,
+                        help="Specific payload/job log to correlate (repeatable; relative paths use --job-dir). "
+                             "If omitted, hang mode discovers payload stdout/stderr and log-like files under workDir.")
+    parser.add_argument("--no-job-logs", dest="collect_job_logs", action="store_false", default=True,
+                        help="Disable bounded host-side payload/job log correlation.")
+    parser.add_argument("--max-job-log-files", type=int, default=DEFAULT_MAX_JOB_LOG_FILES,
+                        help=f"Maximum discovered payload/job log files to scan (default: {DEFAULT_MAX_JOB_LOG_FILES}).")
+    parser.add_argument("--max-job-log-matches", type=int, default=DEFAULT_MAX_JOB_LOG_MATCHES,
+                        help=f"Maximum matched payload/job-log lines retained (default: {DEFAULT_MAX_JOB_LOG_MATCHES}).")
+    parser.add_argument("--job-log-tail-lines", type=int, default=DEFAULT_JOB_LOG_TAIL_LINES,
+                        help=f"Non-empty tail lines retained per payload/runtime log (default: {DEFAULT_JOB_LOG_TAIL_LINES}; 0 disables).")
     parser.add_argument("--exe", default=None,
                         help="Path to the ELF executable. For athena.py jobs this is the Python "
                              "interpreter binary, NOT the .py script. Usually auto-detected.")
@@ -1623,6 +3190,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help=f"Stack frames per thread (default: {DEFAULT_MAX_FRAMES}).")
     parser.add_argument("--max-thread-groups", type=int, default=DEFAULT_MAX_THREAD_GROUPS,
                         help=f"Distinct thread backtraces to keep (default: {DEFAULT_MAX_THREAD_GROUPS}).")
+    parser.add_argument("--max-targeted-threads", type=int, default=DEFAULT_MAX_TARGETED_THREADS,
+                        help=f"Non-idle thread groups to inspect with focused frame/args/locals commands; "
+                             f"0 disables this extra phase (default: {DEFAULT_MAX_TARGETED_THREADS}).")
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS,
                         help=f"Maximum response tokens (default: {DEFAULT_MAX_TOKENS}).")
     parser.add_argument("--max-evidence-chars", type=int, default=DEFAULT_MAX_EVIDENCE_CHARS,
@@ -1699,8 +3269,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     started = time.monotonic()
     try:
         evidence, raw = collect_evidence(args, progress=progress, detail=detail)
-        evidence = enforce_global_budget(evidence, args.max_evidence_chars, detail=detail)
-    except (FileNotFoundError, OSError) as exc:
+    except (FileNotFoundError, OSError, RuntimeError, json.JSONDecodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
@@ -1714,9 +3283,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     analysis: dict[str, Any] | None = None
     if not args.no_llm:
+        # Cost control belongs to the LLM input, not to the deterministic
+        # evidence artifact.  Keep the report/JSON complete and reduce only a
+        # deep copy that is about to be sent to the model.
+        llm_evidence = enforce_global_budget(
+            copy.deepcopy(evidence), args.max_evidence_chars, detail=detail
+        )
         try:
             analysis = analyze_with_llm(
-                evidence, resolve_model(args.model), args.max_tokens, args.max_evidence_chars,
+                llm_evidence, resolve_model(args.model), args.max_tokens, args.max_evidence_chars,
                 progress=progress, detail=detail,
             )
         except RuntimeError as exc:
