@@ -4,6 +4,14 @@ A small Python command-line utility for displaying the latest commit message fro
 
 The command can be run either from the repository itself or by specifying a target repository directory with `--target-directory`.
 
+**Note**: one can use the git command directly to get the same information:
+
+```bash
+git log -1 --pretty=%B
+```
+
+although only for the current working directory. This script allows specifying a different target directory.
+
 ## Requirements
 
 * Python 3.8 or later
