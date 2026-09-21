@@ -5,6 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+""" Show the latest GitHub repository commit notes. """
 
 def main():
     parser = argparse.ArgumentParser(
